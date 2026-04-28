@@ -200,8 +200,11 @@ class BambuCloudClient {
                                  void* event_data);
   static void task_entry(void* context);
 
+  void apply_configuration(BambuCloudCredentials credentials, std::string printer_serial);
   void handle_mqtt_event(esp_mqtt_event_handle_t event);
   void stop_mqtt_client();
+  void process_pending_chamber_light_command();
+  bool publish_chamber_light_command(bool on);
   void task_loop();
   bool login();
   bool authenticate_with_password();
@@ -268,6 +271,9 @@ class BambuCloudClient {
   CloudRestRuntimeState rest_runtime_{};
   mutable std::mutex cloud_devices_mutex_{};
   std::vector<CloudDeviceInfo> cloud_devices_{};
+  mutable std::mutex pending_config_mutex_{};
+  BambuCloudCredentials pending_credentials_{};
+  std::string pending_printer_serial_{};
   const ConfigStore* config_store_ = nullptr;
   BambuCloudCredentials credentials_{};
   std::string requested_serial_{};
@@ -291,6 +297,9 @@ class BambuCloudClient {
   std::atomic<bool> live_mqtt_enabled_{true};
   std::atomic<bool> preview_fetch_enabled_{false};
   std::atomic<bool> reload_requested_{false};
+  std::atomic<bool> reconfigure_requested_{false};
+  std::atomic<bool> chamber_light_command_pending_{false};
+  std::atomic<bool> chamber_light_command_on_{false};
   std::atomic<bool> received_live_payload_{false};
   std::atomic<bool> initial_sync_sent_{false};
   std::function<void(bool online)> printer_presence_callback_{};

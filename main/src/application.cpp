@@ -90,6 +90,54 @@ TickType_t hybrid_cloud_fallback_delay(const PrinterSnapshot& local_snapshot,
              : kHybridCloudFallbackDelayLocalFirst;
 }
 
+struct ChamberLightCommandPlan {
+  bool try_local = false;
+  bool try_cloud = false;
+};
+
+ChamberLightCommandPlan chamber_light_command_plan(SourceMode source_mode,
+                                                   bool hybrid_prefers_cloud,
+                                                   bool hybrid_local_status_supported_now,
+                                                   bool local_network_ready,
+                                                   bool local_printer_enabled,
+                                                   bool cloud_network_ready,
+                                                   const PrinterSnapshot& local_snapshot,
+                                                   const BambuCloudSnapshot& cloud_snapshot) {
+  ChamberLightCommandPlan plan;
+  switch (source_mode) {
+    case SourceMode::kLocalOnly:
+      plan.try_local = true;
+      break;
+    case SourceMode::kCloudOnly:
+      plan.try_cloud = true;
+      break;
+    case SourceMode::kHybrid:
+    default:
+      plan.try_local =
+          !hybrid_prefers_cloud && hybrid_local_status_supported_now && local_network_ready &&
+          local_printer_enabled &&
+          (local_snapshot.local_connected ||
+           printer_model_has_chamber_light(local_snapshot.local_model));
+      plan.try_cloud =
+          cloud_network_ready &&
+          (cloud_snapshot.connected || printer_model_has_chamber_light(cloud_snapshot.model));
+      break;
+  }
+  return plan;
+}
+
+void mark_chamber_light_state(PrinterSnapshot& snapshot, bool on) {
+  snapshot.chamber_light_supported = true;
+  snapshot.chamber_light_state_known = true;
+  snapshot.chamber_light_on = on;
+}
+
+void mark_chamber_light_state(BambuCloudSnapshot& snapshot, bool on) {
+  snapshot.chamber_light_supported = true;
+  snapshot.chamber_light_state_known = true;
+  snapshot.chamber_light_on = on;
+}
+
 void wait_for_next_iteration(Ui& ui, TickType_t delay) {
   TickType_t remaining = delay;
   while (remaining > 0) {
@@ -325,15 +373,11 @@ void Application::run() {
         stop_banner_until_tick_ = 0;
       }
     }
-    if (local_print_is_live(local_snapshot) || cloud_print_is_live(cloud_snapshot)) {
-      print_activity_seen_this_session_ = true;
-    }
     auto build_merged_snapshot = [&](const PrinterSnapshot& current_local_snapshot,
                                      const BambuCloudSnapshot& current_cloud_snapshot) {
       PrinterSnapshot merged =
           merge_status_sources(current_local_snapshot, local_printer_enabled_, current_cloud_snapshot,
-                               source_mode_, now_ms, wifi_connected, wifi_ip,
-                               print_activity_seen_this_session_);
+                               source_mode_, now_ms, wifi_connected, wifi_ip);
       merged.setup_ap_active = current_local_snapshot.setup_ap_active;
       merged.setup_ap_ssid = current_local_snapshot.setup_ap_ssid;
       merged.setup_ap_password = current_local_snapshot.setup_ap_password;
@@ -367,43 +411,22 @@ void Application::run() {
       const bool requested_on =
           !snapshot.chamber_light_state_known || !snapshot.chamber_light_on;
       bool command_sent = false;
+      const ChamberLightCommandPlan light_plan =
+          chamber_light_command_plan(source_mode_, hybrid_prefers_cloud,
+                                     hybrid_local_status_supported_now, local_network_ready,
+                                     local_printer_enabled_, cloud_network_ready,
+                                     local_snapshot, cloud_snapshot);
 
-      if (source_mode_ == SourceMode::kLocalOnly) {
+      if (light_plan.try_local) {
         command_sent = printer_client_.set_chamber_light(requested_on);
         if (command_sent) {
-          local_snapshot.chamber_light_supported = true;
-          local_snapshot.chamber_light_state_known = true;
-          local_snapshot.chamber_light_on = requested_on;
+          mark_chamber_light_state(local_snapshot, requested_on);
         }
-      } else if (source_mode_ == SourceMode::kCloudOnly) {
+      }
+      if (!command_sent && light_plan.try_cloud) {
         command_sent = cloud_client_.set_chamber_light(requested_on);
         if (command_sent) {
-          cloud_snapshot.chamber_light_supported = true;
-          cloud_snapshot.chamber_light_state_known = true;
-          cloud_snapshot.chamber_light_on = requested_on;
-        }
-      } else {
-        const bool local_light_available =
-            !hybrid_prefers_cloud && hybrid_local_status_supported_now && local_network_ready &&
-            local_printer_enabled_ &&
-            (local_snapshot.local_connected ||
-             printer_model_has_chamber_light(local_snapshot.local_model));
-        if (local_light_available) {
-          command_sent = printer_client_.set_chamber_light(requested_on);
-          if (command_sent) {
-            local_snapshot.chamber_light_supported = true;
-            local_snapshot.chamber_light_state_known = true;
-            local_snapshot.chamber_light_on = requested_on;
-          }
-        }
-        if (!command_sent && cloud_network_ready &&
-            (cloud_snapshot.connected || printer_model_has_chamber_light(cloud_snapshot.model))) {
-          command_sent = cloud_client_.set_chamber_light(requested_on);
-          if (command_sent) {
-            cloud_snapshot.chamber_light_supported = true;
-            cloud_snapshot.chamber_light_state_known = true;
-            cloud_snapshot.chamber_light_on = requested_on;
-          }
+          mark_chamber_light_state(cloud_snapshot, requested_on);
         }
       }
 

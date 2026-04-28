@@ -91,8 +91,11 @@ class PrinterClient {
   void handle_report_payload(const char* payload, size_t length);
   void task_loop();
   void stop_client();
-  void schedule_client_rebuild(const char* reason, uint32_t delay_ms = 1500);
+  void schedule_client_rebuild(const char* reason, uint32_t delay_ms = 1500,
+                               bool force_when_connected = false);
   void cancel_client_rebuild();
+  void process_pending_chamber_light_command();
+  bool publish_chamber_light_command(bool on);
   PrinterConnection desired_connection() const;
   void set_waiting_snapshot(const PrinterConnection& connection);
   bool publish_request(const char* payload);
@@ -145,7 +148,10 @@ class PrinterClient {
   std::atomic<bool> first_payload_observed_{false};
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> reconfigure_requested_{false};
+  std::atomic<bool> chamber_light_command_pending_{false};
+  std::atomic<bool> chamber_light_command_on_{false};
   std::atomic<bool> client_rebuild_requested_{false};
+  std::atomic<bool> force_client_rebuild_{false};
   std::atomic<uint32_t> last_message_tick_{0};
   std::atomic<uint32_t> initial_sync_tick_{0};
   std::atomic<uint32_t> connection_state_tick_{0};

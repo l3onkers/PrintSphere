@@ -12,9 +12,11 @@ project(printsphere_idf)
 # Work around an Xtensa GCC ICE seen in ESP-IDF 5.5.2 while compiling
 # esp_lcd_panel_rgb.c with the default debug/-Og flags on Windows.
 idf_component_get_property(ESP_LCD_DIR esp_lcd COMPONENT_DIR)
-if(ESP_LCD_DIR)
+idf_component_get_property(ESP_LCD_LIB esp_lcd COMPONENT_LIB)
+if(ESP_LCD_DIR AND ESP_LCD_LIB)
     set_source_files_properties(
         "${ESP_LCD_DIR}/rgb/esp_lcd_panel_rgb.c"
+        TARGET_DIRECTORY ${ESP_LCD_LIB}
         PROPERTIES
             COMPILE_OPTIONS "-O0"
     )

@@ -9,8 +9,10 @@
 #include <utility>
 #include <vector>
 
+#include "bsp/esp32_s3_touch_amoled_1_75.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "esp_tls.h"
 
@@ -22,7 +24,10 @@ constexpr char kTag[] = "printsphere.camera";
 constexpr uint16_t kCameraPort = 6000;
 constexpr size_t kFrameHeaderBytes = 16;
 constexpr size_t kMaxFrameBytes = 256U * 1024U;
+constexpr size_t kImagePersistentReserveBytes = 20U * 1024U;
 constexpr int64_t kAutoRefreshIntervalUs = 2000000;
+constexpr int64_t kTlsReadDeadlineUs = 4000000;
+constexpr int64_t kTlsWriteDeadlineUs = 2000000;
 constexpr uint16_t kTargetWidth = 400;
 constexpr uint16_t kTargetHeight = 224;
 
@@ -57,6 +62,91 @@ std::array<uint8_t, 80> make_auth_packet(const PrinterConnection& connection) {
   std::memcpy(packet.data() + 48, connection.access_code.data(), password_bytes);
   return packet;
 }
+
+const char* ram_region(const void* ptr) {
+  if (ptr == nullptr) {
+    return "null";
+  }
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+  return esp_ptr_external_ram(ptr) ? "psram" : "internal";
+#else
+  return "internal";
+#endif
+}
+
+size_t allocated_size(const void* ptr) {
+  return ptr == nullptr ? 0U : heap_caps_get_allocated_size(const_cast<void*>(ptr));
+}
+
+void log_heap_diag(const char* context) {
+  ESP_LOGI(kTag,
+           "[RAM] %s: int_free=%u int_largest=%u dma_free=%u dma_largest=%u "
+           "psram_free=%u psram_largest=%u",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+void log_ptr_diag(const char* context, const void* ptr, size_t bytes) {
+  ESP_LOGI(kTag,
+           "[RAM] %s: ptr=%p bytes=%u alloc=%u ram=%s",
+           context != nullptr ? context : "-", ptr,
+           static_cast<unsigned>(bytes),
+           static_cast<unsigned>(allocated_size(ptr)),
+           ram_region(ptr));
+  log_heap_diag(context);
+}
+
+void log_blob_diag(const char* context, const std::shared_ptr<std::vector<uint8_t>>& blob) {
+  const void* data = blob && !blob->empty() ? blob->data() : nullptr;
+  ESP_LOGI(kTag,
+           "[RAM] %s: size=%u capacity=%u alloc=%u ram=%s data=%p",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(blob ? blob->size() : 0U),
+           static_cast<unsigned>(blob ? blob->capacity() : 0U),
+           static_cast<unsigned>(allocated_size(data)),
+           ram_region(data), data);
+  log_heap_diag(context);
+}
+
+class DisplayDecodeGuard {
+ public:
+  explicit DisplayDecodeGuard(uint32_t timeout_ms) {
+    const uint32_t before = esp_log_timestamp();
+    locked_ = bsp_display_lock(timeout_ms) == ESP_OK;
+    wait_ms_ = esp_log_timestamp() - before;
+    if (!locked_) {
+      ESP_LOGW(kTag, "Camera JPEG decode skipped: LVGL lock busy after %lums",
+               static_cast<unsigned long>(wait_ms_));
+    } else {
+      acquired_ms_ = esp_log_timestamp();
+    }
+  }
+
+  ~DisplayDecodeGuard() {
+    if (!locked_) {
+      return;
+    }
+    const uint32_t held_ms = esp_log_timestamp() - acquired_ms_;
+    bsp_display_unlock();
+    if (wait_ms_ > 20 || held_ms > 120) {
+      ESP_LOGI(kTag, "Camera JPEG decode display guard: wait=%lums held=%lums",
+               static_cast<unsigned long>(wait_ms_),
+               static_cast<unsigned long>(held_ms));
+    }
+  }
+
+  bool locked() const { return locked_; }
+
+ private:
+  bool locked_ = false;
+  uint32_t wait_ms_ = 0;
+  uint32_t acquired_ms_ = 0;
+};
 
 }  // namespace
 
@@ -179,7 +269,11 @@ bool P1sCameraClient::has_cached_frame() const {
 bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
   auto* out = static_cast<uint8_t*>(buffer);
   size_t offset = 0;
+  const int64_t deadline_us = esp_timer_get_time() + kTlsReadDeadlineUs;
   while (offset < length) {
+    if (esp_timer_get_time() >= deadline_us) {
+      return false;
+    }
     const ssize_t read = esp_tls_conn_read(tls, out + offset, length - offset);
     if (read <= 0) {
       return false;
@@ -192,7 +286,11 @@ bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
 bool P1sCameraClient::write_all(esp_tls_t* tls, const void* buffer, size_t length) {
   const auto* data = static_cast<const uint8_t*>(buffer);
   size_t offset = 0;
+  const int64_t deadline_us = esp_timer_get_time() + kTlsWriteDeadlineUs;
   while (offset < length) {
+    if (esp_timer_get_time() >= deadline_us) {
+      return false;
+    }
     const ssize_t written = esp_tls_conn_write(tls, data + offset, length - offset);
     if (written <= 0) {
       return false;
@@ -206,6 +304,8 @@ bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
   if (tls_ != nullptr) {
     return true;
   }
+
+  log_heap_diag("camera before tls init");
 
   esp_tls_cfg_t tls_cfg = {};
   tls_cfg.timeout_ms = 7000;
@@ -240,6 +340,7 @@ bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
 
   ESP_LOGI(kTag, "Connected to local chamber camera on %s:%u", connection.host.c_str(),
            static_cast<unsigned>(kCameraPort));
+  log_heap_diag("camera after tls auth");
   return true;
 }
 
@@ -267,6 +368,11 @@ bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint
   jpeg_dec_io_t io = {};
   jpeg_dec_header_info_t header = {};
 
+  DisplayDecodeGuard display_guard(250);
+  if (!display_guard.locked()) {
+    return false;
+  }
+
   if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) {
     ESP_LOGW(kTag, "JPEG decoder open failed");
     return false;
@@ -292,8 +398,11 @@ bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint
     aligned_out = jpeg_calloc_align(static_cast<size_t>(out_len), 16);
     if (aligned_out == nullptr) {
       ESP_LOGW(kTag, "JPEG aligned buffer allocation failed");
+      log_heap_diag("camera jpeg aligned allocation failed");
       break;
     }
+    log_ptr_diag("camera jpeg aligned decode buffer", aligned_out,
+                 static_cast<size_t>(out_len));
 
     io.outbuf = static_cast<uint8_t*>(aligned_out);
     if (jpeg_dec_process(decoder, &io) != JPEG_ERR_OK) {
@@ -302,8 +411,10 @@ bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint
     }
 
     auto decoded = std::make_shared<std::vector<uint8_t>>();
+    decoded->reserve(std::max(static_cast<size_t>(out_len), kImagePersistentReserveBytes));
     decoded->resize(static_cast<size_t>(out_len));
     std::memcpy(decoded->data(), aligned_out, static_cast<size_t>(out_len));
+    log_blob_diag("camera rgb565 decoded buffer", decoded);
     *out_blob = std::move(decoded);
     *out_width = config.scale.width > 0U ? config.scale.width : header.width;
     *out_height = config.scale.height > 0U ? config.scale.height : header.height;
@@ -359,12 +470,14 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
     }
 
     auto jpeg_frame = std::make_shared<std::vector<uint8_t>>();
+    jpeg_frame->reserve(std::max(static_cast<size_t>(frame_size), kImagePersistentReserveBytes));
     jpeg_frame->resize(frame_size);
     if (!read_exact(tls_, jpeg_frame->data(), jpeg_frame->size())) {
       ESP_LOGW(kTag, "Camera frame body read failed");
       disconnect();
       return false;
     }
+    log_blob_diag("camera jpeg frame buffer", jpeg_frame);
 
     if ((*jpeg_frame)[0] != 0xFFU || (*jpeg_frame)[1] != 0xD8U ||
         (*jpeg_frame)[jpeg_frame->size() - 2] != 0xFFU ||
@@ -382,13 +495,9 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
 
     set_frame_snapshot(true, enabled_.load(), true, "Camera image updated",
                        std::move(rgb565_frame), width, height);
-    const size_t free_dma_heap = heap_caps_get_free_size(MALLOC_CAP_DMA);
-    const size_t largest_dma_block = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
-    ESP_LOGD(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
+    ESP_LOGI(kTag, "Camera snapshot decoded: %ux%u RGB565", static_cast<unsigned>(width),
              static_cast<unsigned>(height));
-    ESP_LOGD(kTag, "DMA heap after snapshot: free=%u largest=%u",
-             static_cast<unsigned>(free_dma_heap),
-             static_cast<unsigned>(largest_dma_block));
+    log_heap_diag("camera after snapshot publish");
     return true;
   }
 

@@ -136,6 +136,7 @@ constexpr uint32_t kNoDataProbeMs = 30000;
 constexpr uint32_t kNoDataReconnectMs = 15000;
 constexpr uint32_t kDisconnectedStallMs = 20000;
 constexpr uint32_t kRebuildDelayMs = 1500;
+constexpr size_t kMaxMqttPayloadBytes = 64U * 1024U;
 
 extern const uint8_t bambu_root_cert_start[] asm("_binary_bambu_cert_start");
 extern const uint8_t bambu_root_cert_end[] asm("_binary_bambu_cert_end");
@@ -471,14 +472,19 @@ void log_heap_status(const char* context) {
   const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
   const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA);
   const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+  const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 
   ESP_LOGI(kTag,
-           "%s heap: internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u",
+           "[RAM] %s heap: internal_free=%u internal_largest=%u dma_free=%u dma_largest=%u "
+           "psram_free=%u psram_largest=%u",
            context != nullptr ? context : "heap",
            static_cast<unsigned int>(internal_free),
            static_cast<unsigned int>(internal_largest),
            static_cast<unsigned int>(dma_free),
-           static_cast<unsigned int>(dma_largest));
+           static_cast<unsigned int>(dma_largest),
+           static_cast<unsigned int>(psram_free),
+           static_cast<unsigned int>(psram_largest));
 }
 
 std::string make_client_id() {
@@ -1209,34 +1215,17 @@ bool PrinterClient::is_configured() const {
 }
 
 bool PrinterClient::set_chamber_light(bool on) {
-  LocalPrinterRuntimeState runtime = runtime_state_copy();
-  const bool supports_secondary =
-      printer_model_has_secondary_chamber_light(runtime.local_model);
-
-  auto publish_ledctrl = [&](const char* node) {
-    const std::string payload = build_ledctrl_payload(node, on);
-    if (!mqtt_connected_ || client_ == nullptr || payload.empty()) {
-      return false;
-    }
-
-    const int msg_id =
-        esp_mqtt_client_publish(client_, request_topic_.c_str(), payload.c_str(), 0, 0, 0);
-    if (msg_id < 0) {
-      ESP_LOGW(kTag, "Failed to publish chamber light command for %s", node);
-      return false;
-    }
-    return true;
-  };
-
-  const bool primary_ok = publish_ledctrl("chamber_light");
-  const bool secondary_ok = !supports_secondary || publish_ledctrl("chamber_light2");
-  if (!primary_ok || !secondary_ok) {
+  if (!mqtt_connected_.load()) {
     return false;
   }
 
+  chamber_light_command_on_ = on;
+  chamber_light_command_pending_ = true;
+  wake_task();
+
+  LocalPrinterRuntimeState runtime = runtime_state_copy();
   // No pushall here — the printer sends a status update automatically when the light changes.
-  // Sending pushall triggered a burst of ~30 full-status reports (1/sec) that spiked internal
-  // heap usage and starved DMA-capable memory needed by the SPI display driver.
+  // The network task publishes the MQTT command so UI/App code never races the client handle.
 
   runtime.chamber_light_supported = true;
   runtime.chamber_light_state_known = true;
@@ -1244,7 +1233,7 @@ bool PrinterClient::set_chamber_light(bool on) {
   update_local_runtime_metadata(&runtime, true, mqtt_connected_.load());
   store_runtime_state(std::move(runtime), false);
   publish_runtime_snapshot();
-  ESP_LOGI(kTag, "Local chamber light set to %s", on ? "on" : "off");
+  ESP_LOGI(kTag, "Local chamber light command queued: %s", on ? "on" : "off");
   return true;
 }
 
@@ -1471,6 +1460,16 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     case MQTT_EVENT_DATA: {
       std::string topic;
       std::string payload;
+      if (event->total_data_len <= 0 ||
+          static_cast<size_t>(event->total_data_len) > kMaxMqttPayloadBytes) {
+        if (event->current_data_offset == 0) {
+          ESP_LOGW(kTag, "Dropping oversized MQTT payload: %d bytes", event->total_data_len);
+        }
+        std::lock_guard<std::mutex> lock(incoming_mutex_);
+        incoming_topic_.clear();
+        incoming_payload_.clear();
+        break;
+      }
 
       {
         std::unique_lock<std::mutex> lock(incoming_mutex_);
@@ -2241,8 +2240,10 @@ void PrinterClient::stop_client() {
   initial_sync_sent_ = false;
   delayed_pushall_sent_ = false;
   first_payload_observed_ = false;
+  chamber_light_command_pending_ = false;
   client_started_ = false;
   client_rebuild_requested_ = false;
+  force_client_rebuild_ = false;
   last_message_tick_ = 0;
   initial_sync_tick_ = 0;
   connection_state_tick_ = 0;
@@ -2268,20 +2269,75 @@ void PrinterClient::stop_client() {
   }
 }
 
-void PrinterClient::schedule_client_rebuild(const char* reason, uint32_t delay_ms) {
-  if (client_rebuild_requested_.exchange(true)) {
+bool PrinterClient::publish_chamber_light_command(bool on) {
+  if (!mqtt_connected_.load() || client_ == nullptr) {
+    return false;
+  }
+
+  const LocalPrinterRuntimeState runtime = runtime_state_copy();
+  const bool supports_secondary =
+      printer_model_has_secondary_chamber_light(runtime.local_model);
+
+  auto publish_ledctrl = [&](const char* node) {
+    const std::string payload = build_ledctrl_payload(node, on);
+    if (payload.empty()) {
+      return false;
+    }
+
+    const int msg_id =
+        esp_mqtt_client_publish(client_, request_topic_.c_str(), payload.c_str(), 0, 0, 0);
+    if (msg_id < 0) {
+      ESP_LOGW(kTag, "Failed to publish chamber light command for %s", node);
+      return false;
+    }
+    return true;
+  };
+
+  const bool primary_ok = publish_ledctrl("chamber_light");
+  const bool secondary_ok = !supports_secondary || publish_ledctrl("chamber_light2");
+  return primary_ok && secondary_ok;
+}
+
+void PrinterClient::process_pending_chamber_light_command() {
+  if (!chamber_light_command_pending_.load() || !mqtt_connected_.load() || client_ == nullptr) {
     return;
   }
+
+  const bool on = chamber_light_command_on_.load();
+  chamber_light_command_pending_ = false;
+  if (publish_chamber_light_command(on)) {
+    ESP_LOGI(kTag, "Local chamber light command published: %s", on ? "on" : "off");
+  } else {
+    ESP_LOGW(kTag, "Local chamber light command publish failed");
+  }
+}
+
+void PrinterClient::schedule_client_rebuild(const char* reason, uint32_t delay_ms,
+                                            bool force_when_connected) {
   uint32_t effective_ms = delay_ms == 0 ? kRebuildDelayMs : delay_ms;
+  if (session_ever_established_.load() && effective_ms > 5000U) {
+    effective_ms = 5000U;
+  }
+  const uint32_t delay_ticks = pdMS_TO_TICKS(effective_ms);
+
+  if (force_when_connected) {
+    force_client_rebuild_ = true;
+  }
+  if (client_rebuild_requested_.exchange(true)) {
+    if (force_when_connected) {
+      rebuild_request_tick_ = xTaskGetTickCount();
+      rebuild_delay_ticks_ = delay_ticks;
+      ESP_LOGW(kTag, "Upgrading pending MQTT client rebuild to forced in %u ms (%s)",
+               static_cast<unsigned int>(effective_ms),
+               reason != nullptr ? reason : "unspecified");
+    }
+    return;
+  }
   // Once the session has been established at least once for this profile,
   // subsequent rebuilds are cheap (no TCP probe, no fresh TLS session —
   // esp-mqtt's internal reconnect handles it). Cap long backoffs so a
   // transient drop doesn't strand us in a 30 s retry window, which in
   // local-only mode nobody would wake us out of.
-  if (session_ever_established_.load() && effective_ms > 5000U) {
-    effective_ms = 5000U;
-  }
-  const uint32_t delay_ticks = pdMS_TO_TICKS(effective_ms);
   rebuild_request_tick_ = xTaskGetTickCount();
   rebuild_delay_ticks_ = delay_ticks;
   ESP_LOGW(kTag, "Scheduling MQTT client rebuild in %u ms (%s)",
@@ -2291,6 +2347,7 @@ void PrinterClient::schedule_client_rebuild(const char* reason, uint32_t delay_m
 
 void PrinterClient::cancel_client_rebuild() {
   client_rebuild_requested_ = false;
+  force_client_rebuild_ = false;
   rebuild_request_tick_ = 0;
   rebuild_delay_ticks_ = 0;
 }
@@ -2349,13 +2406,15 @@ void PrinterClient::task_loop() {
 
     uint32_t now = xTaskGetTickCount();
     if (client_rebuild_requested_.load()) {
-      if (mqtt_connected_.load()) {
+      const bool force_rebuild = force_client_rebuild_.load();
+      if (mqtt_connected_.load() && !force_rebuild) {
         cancel_client_rebuild();
       } else {
         const uint32_t requested_at = rebuild_request_tick_.load();
         const uint32_t delay_ticks = rebuild_delay_ticks_.load();
         if (requested_at == 0 || tick_elapsed(requested_at, now, delay_ticks)) {
-          ESP_LOGW(kTag, "Rebuilding MQTT client after disconnect/error");
+          ESP_LOGW(kTag, "Rebuilding MQTT client after disconnect/error%s",
+                   force_rebuild ? " (forced)" : "");
           stop_client();
           cancel_client_rebuild();
           vTaskDelay(pdMS_TO_TICKS(250));
@@ -2658,7 +2717,7 @@ void PrinterClient::task_loop() {
       const uint32_t initial_sync_tick = initial_sync_tick_.load();
       if (tick_elapsed(initial_sync_tick, now, pdMS_TO_TICKS(kInitialSyncTimeoutMs))) {
         ESP_LOGW(kTag, "Still no status payload after delayed pushall, forcing reconnect");
-        schedule_client_rebuild("initial sync timeout");
+        schedule_client_rebuild("initial sync timeout", kRebuildDelayMs, true);
       }
     }
 
@@ -2667,12 +2726,13 @@ void PrinterClient::task_loop() {
       if (tick_elapsed(last, now, pdMS_TO_TICKS(kNoDataProbeMs))) {
         const uint32_t probe_tick = watchdog_probe_tick_.load();
         if (probe_tick == 0) {
-          ESP_LOGW(kTag, "No MQTT data for 90s, sending keepalive start request");
+          ESP_LOGW(kTag, "No MQTT data for %us, sending keepalive start request",
+                   static_cast<unsigned>(kNoDataProbeMs / 1000U));
           publish_request(kStartPush);
           watchdog_probe_tick_ = now;
         } else if (tick_elapsed(probe_tick, now, pdMS_TO_TICKS(kNoDataReconnectMs))) {
           ESP_LOGW(kTag, "Still no MQTT data after keepalive probe, forcing reconnect");
-          schedule_client_rebuild("no data watchdog");
+          schedule_client_rebuild("no data watchdog", kRebuildDelayMs, true);
         }
       } else {
         watchdog_probe_tick_ = 0;
@@ -2686,6 +2746,8 @@ void PrinterClient::task_loop() {
         schedule_client_rebuild("disconnected stall");
       }
     }
+
+    process_pending_chamber_light_command();
 
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
   }

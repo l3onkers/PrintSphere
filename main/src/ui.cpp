@@ -11,7 +11,9 @@
 #include "misc/cache/instance/lv_image_cache.h"
 #include "bsp/esp32_s3_touch_amoled_1_75.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "driver/gpio.h"
 #include "png.h"
@@ -32,6 +34,7 @@ namespace printsphere {
 namespace {
 
 constexpr char kTag[] = "printsphere.ui";
+constexpr size_t kImagePersistentReserveBytes = 20U * 1024U;
 constexpr int kDefaultBrightnessPercent = 80;
 constexpr int kRingStrokeWidth = 22;
 constexpr int kRemainingRowY = 172;
@@ -149,6 +152,46 @@ class LvglLockGuard {
 };
 
 uint32_t LvglLockGuard::lock_fail_count_ = 0;
+
+const char* ram_region(const void* ptr) {
+  if (ptr == nullptr) {
+    return "null";
+  }
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+  return esp_ptr_external_ram(ptr) ? "psram" : "internal";
+#else
+  return "internal";
+#endif
+}
+
+size_t allocated_size(const void* ptr) {
+  return ptr == nullptr ? 0U : heap_caps_get_allocated_size(const_cast<void*>(ptr));
+}
+
+void log_heap_diag(const char* context) {
+  ESP_LOGI(kTag,
+           "[RAM] %s: int_free=%u int_largest=%u dma_free=%u dma_largest=%u "
+           "psram_free=%u psram_largest=%u",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+void log_blob_diag(const char* context, const std::shared_ptr<std::vector<uint8_t>>& blob) {
+  const void* data = blob && !blob->empty() ? blob->data() : nullptr;
+  ESP_LOGI(kTag,
+           "[RAM] %s: size=%u capacity=%u alloc=%u ram=%s data=%p",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(blob ? blob->size() : 0U),
+           static_cast<unsigned>(blob ? blob->capacity() : 0U),
+           static_cast<unsigned>(allocated_size(data)),
+           ram_region(data), data);
+  log_heap_diag(context);
+}
 
 bsp_display_rotation_t bsp_rotation_for(DisplayRotation rotation) {
   switch (rotation) {
@@ -346,6 +389,7 @@ bool decode_preview_png(const std::shared_ptr<std::vector<uint8_t>>& encoded_blo
   const size_t row_stride = static_cast<size_t>(image.width) * 4U;
   const size_t decoded_size = PNG_IMAGE_SIZE(image);
   auto raw = std::make_shared<std::vector<uint8_t>>();
+  raw->reserve(std::max(decoded_size, kImagePersistentReserveBytes));
   raw->resize(decoded_size);
 
   const bool ok = png_image_finish_read(&image, nullptr, raw->data(),
@@ -367,6 +411,8 @@ bool decode_preview_png(const std::shared_ptr<std::vector<uint8_t>>& encoded_blo
   image_dsc->header.stride = static_cast<uint16_t>(row_stride);
   image_dsc->data_size = static_cast<uint32_t>(raw->size());
   image_dsc->data = raw->data();
+  log_blob_diag("ui preview encoded png", encoded_blob);
+  log_blob_diag("ui preview decoded raw", raw);
   *decoded_blob = std::move(raw);
   return true;
 }
@@ -1406,12 +1452,12 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
     return;
   }
 
-  // Pre-decode preview PNG outside LVGL lock.  decode_preview_png() is pure
-  // computation (heap alloc + libpng) that can block the CPU for 200-500 ms
-  // on a typical cover image.  Holding the LVGL mutex that long starves the
-  // LVGL worker and eventually freezes the display.
+  // Pre-decode preview PNG outside LVGL lock, but only when the preview page is
+  // actually active. The decoded cover is ~1 MB, lives in PSRAM, and is kept
+  // cached across page changes so navigating away doesn't create a decode storm.
   std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw;
   lv_image_dsc_t pre_decoded_dsc{};
+  const bool preview_page_active = !scrolling_ && active_page_ == 3;
   const bool preview_blob_changed =
       snapshot.preview_blob && !snapshot.preview_blob->empty() &&
       last_preview_blob_.get() != snapshot.preview_blob.get();
@@ -1421,7 +1467,7 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
       !preview_blob_changed && snapshot.preview_blob &&
       !snapshot.preview_blob->empty() &&
       (!last_preview_raw_ || last_preview_raw_->empty());
-  if (preview_blob_changed || needs_first_decode) {
+  if (preview_page_active && (preview_blob_changed || needs_first_decode)) {
     decode_preview_png(snapshot.preview_blob, &pre_decoded_raw, &pre_decoded_dsc);
   }
 
@@ -1546,6 +1592,7 @@ bool Ui::ensure_preview_image_loaded_locked(
     last_preview_raw_ = std::move(pre_decoded_raw);
     preview_image_dsc_ = *pre_decoded_dsc;
     lv_image_set_src(page2_image_, &preview_image_dsc_);
+    log_blob_diag("ui preview set_src raw", last_preview_raw_);
     return true;
   }
 
@@ -1889,7 +1936,9 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         last_camera_width_ != snapshot.camera_width || last_camera_height_ != snapshot.camera_height) {
       const uint8_t next_slot =
           camera_slot_initialized_ ? static_cast<uint8_t>((active_camera_slot_ + 1U) % 2U) : 0U;
+      log_blob_diag("ui camera incoming rgb565", snapshot.camera_blob);
       lv_image_cache_drop(&camera_image_dscs_[next_slot]);
+      log_heap_diag("ui camera after cache drop");
       lv_image_dsc_t next_dsc = {};
       if (configure_camera_rgb565(snapshot.camera_blob, snapshot.camera_width, snapshot.camera_height,
                                   &next_dsc)) {
@@ -1900,6 +1949,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
         last_camera_width_ = snapshot.camera_width;
         last_camera_height_ = snapshot.camera_height;
         lv_image_set_src(page3_image_, &camera_image_dscs_[active_camera_slot_]);
+        log_heap_diag("ui camera after lv_image_set_src");
       } else {
         camera_blobs_[next_slot].reset();
         std::memset(&camera_image_dscs_[next_slot], 0, sizeof(camera_image_dscs_[next_slot]));
@@ -2839,10 +2889,6 @@ void Ui::set_active_page(int page) {
     const int target_x = lv_obj_get_x(target_page);
     lv_obj_scroll_to_x(pager_, target_x, LV_ANIM_OFF);
   }
-  if (previous_page == 3 && clamped_page != 3) {
-    release_preview_image_locked();
-    preview_image_visible_ = false;
-  }
   active_page_ = clamped_page;
   if (clamped_page == 0 && previous_page != 0) {
     replay_card_animations_locked();
@@ -2905,10 +2951,9 @@ void Ui::handle_pager_event(lv_event_t* event) {
   if (code == LV_EVENT_SCROLL_BEGIN) {
     scrolling_ = true;
 
-    // Eagerly load images for adjacent pages so they are visible during the
-    // scroll transition.  ensure_preview_image_loaded_locked() uses the cached
-    // decoded buffer when available (fast pointer assignment), or falls back to
-    // decoding under lock for the first load.
+    // Eagerly attach already-decoded images for adjacent pages so they are
+    // visible during the scroll transition. First-time PNG decode is kept out
+    // of this LVGL event path.
     if (preview_page_available_ && !preview_image_visible_) {
       preview_image_visible_ = ensure_preview_image_loaded_locked(false);
       if (preview_image_visible_ && !preview_text_image_mode_) {

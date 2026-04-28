@@ -17,9 +17,11 @@
 #include "printsphere/error_lookup.hpp"
 #include "printsphere/status_resolver.hpp"
 #include "esp_crt_bundle.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_system.h"
 #include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_tls.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -41,9 +43,14 @@ constexpr uint16_t kCloudMqttPort = 8883;
 constexpr char kGetVersion[] = "{\"info\":{\"sequence_id\":\"0\",\"command\":\"get_version\"}}";
 constexpr char kPushAll[] = "{\"pushing\":{\"sequence_id\":\"0\",\"command\":\"pushall\"}}";
 constexpr size_t kMaxPreviewBytes = 256 * 1024;
+constexpr size_t kPreviewPersistentReserveBytes = 20 * 1024;
 constexpr size_t kPreviewRangeChunkBytes = 4 * 1024;
 constexpr TickType_t kCloudInitialSyncRetryDelay = pdMS_TO_TICKS(3000);
 constexpr TickType_t kCloudInitialSyncTimeout = pdMS_TO_TICKS(12000);
+constexpr TickType_t kCloudInitialSyncBackoffShort = pdMS_TO_TICKS(15000);
+constexpr TickType_t kCloudInitialSyncBackoffMedium = pdMS_TO_TICKS(30000);
+constexpr TickType_t kCloudInitialSyncBackoffLong = pdMS_TO_TICKS(60000);
+constexpr TickType_t kCloudInitialSyncBackoffMax = pdMS_TO_TICKS(180000);
 constexpr TickType_t kCloudStatusPollIdle = pdMS_TO_TICKS(30000);
 constexpr TickType_t kCloudStatusPollActive = pdMS_TO_TICKS(5000);
 constexpr TickType_t kCloudStatusPollLowPower = pdMS_TO_TICKS(180000);
@@ -56,6 +63,8 @@ constexpr int64_t kCloudAuthRetryBackoffUs =
     static_cast<int64_t>(kCloudAuthRetryBackoffSeconds) * 1000000LL;
 constexpr uint64_t kCloudLiveDataFreshMs = 120000ULL;
 constexpr uint64_t kCloudOptimisticLightMs = 8000ULL;
+constexpr size_t kMaxCloudMqttPayloadBytes = 64U * 1024U;
+constexpr size_t kMaxJsonResponseBytes = 96U * 1024U;
 constexpr int kCloudPrintErrorTaskCanceled = 0x0300400C;
 constexpr int kCloudPrintErrorPrintingCancelled = 0x0500400E;
 
@@ -150,6 +159,59 @@ const char* connect_return_code_name(esp_mqtt_connect_return_code_t code) {
 }
 
 const char* yes_no(bool value) { return value ? "yes" : "no"; }
+
+const char* ram_region(const void* ptr) {
+  if (ptr == nullptr) {
+    return "null";
+  }
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+  return esp_ptr_external_ram(ptr) ? "psram" : "internal";
+#else
+  return "internal";
+#endif
+}
+
+size_t allocated_size(const void* ptr) {
+  return ptr == nullptr ? 0U : heap_caps_get_allocated_size(const_cast<void*>(ptr));
+}
+
+void log_heap_diag(const char* context) {
+  ESP_LOGI(kTag,
+           "[RAM] %s: int_free=%u int_largest=%u dma_free=%u dma_largest=%u "
+           "psram_free=%u psram_largest=%u",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM)));
+}
+
+void log_blob_diag(const char* context, const std::shared_ptr<std::vector<uint8_t>>& blob) {
+  const void* data = blob && !blob->empty() ? blob->data() : nullptr;
+  ESP_LOGI(kTag,
+           "[RAM] %s: size=%u capacity=%u alloc=%u ram=%s data=%p",
+           context != nullptr ? context : "-",
+           static_cast<unsigned>(blob ? blob->size() : 0U),
+           static_cast<unsigned>(blob ? blob->capacity() : 0U),
+           static_cast<unsigned>(allocated_size(data)),
+           ram_region(data), data);
+  log_heap_diag(context);
+}
+
+TickType_t cloud_initial_sync_backoff(uint32_t failures) {
+  if (failures <= 1U) {
+    return kCloudInitialSyncBackoffShort;
+  }
+  if (failures <= 2U) {
+    return kCloudInitialSyncBackoffMedium;
+  }
+  if (failures <= 4U) {
+    return kCloudInitialSyncBackoffLong;
+  }
+  return kCloudInitialSyncBackoffMax;
+}
 
 void log_cloud_mqtt_auth_context(const BambuCloudCredentials& credentials,
                                  const std::string& mqtt_username,
@@ -1757,6 +1819,24 @@ const char* to_string(CloudSetupStage stage) {
 }
 
 void BambuCloudClient::configure(BambuCloudCredentials credentials, std::string printer_serial) {
+  const bool can_apply_inline =
+      task_handle_ == nullptr || xTaskGetCurrentTaskHandle() == task_handle_;
+  if (!can_apply_inline) {
+    {
+      std::lock_guard<std::mutex> lock(pending_config_mutex_);
+      pending_credentials_ = std::move(credentials);
+      pending_printer_serial_ = std::move(printer_serial);
+    }
+    reconfigure_requested_ = true;
+    xTaskNotifyGive(task_handle_);
+    return;
+  }
+
+  apply_configuration(std::move(credentials), std::move(printer_serial));
+}
+
+void BambuCloudClient::apply_configuration(BambuCloudCredentials credentials,
+                                           std::string printer_serial) {
   stop_mqtt_client();
   credentials_ = std::move(credentials);
   requested_serial_ = std::move(printer_serial);
@@ -2166,33 +2246,17 @@ void BambuCloudClient::publish_combined_snapshot() {
 }
 
 bool BambuCloudClient::set_chamber_light(bool on) {
-  const BambuCloudSnapshot current = snapshot();
-  const bool supports_secondary = printer_model_has_secondary_chamber_light(current.model);
-
-  auto publish_ledctrl = [&](const char* node) {
-    const std::string payload = build_ledctrl_payload(node, on);
-    if (payload.empty() || mqtt_client_ == nullptr || !mqtt_connected_.load() ||
-        !mqtt_subscription_acknowledged_.load()) {
-      return false;
-    }
-
-    const int msg_id =
-        esp_mqtt_client_publish(mqtt_client_, mqtt_request_topic_.c_str(), payload.c_str(), 0, 0, 0);
-    if (msg_id < 0) {
-      ESP_LOGW(kTag, "Failed to publish cloud chamber light command for %s", node);
-      return false;
-    }
-    return true;
-  };
-
-  const bool primary_ok = publish_ledctrl("chamber_light");
-  const bool secondary_ok = !supports_secondary || publish_ledctrl("chamber_light2");
-  if (!primary_ok || !secondary_ok) {
+  if (!mqtt_connected_.load() || !mqtt_subscription_acknowledged_.load()) {
     return false;
   }
 
-  publish_request(kPushAll);
+  chamber_light_command_on_ = on;
+  chamber_light_command_pending_ = true;
+  if (task_handle_ != nullptr && xTaskGetCurrentTaskHandle() != task_handle_) {
+    xTaskNotifyGive(task_handle_);
+  }
 
+  const BambuCloudSnapshot current = snapshot();
   CloudLiveRuntimeState runtime = live_runtime_copy();
   runtime.configured = current.configured;
   runtime.connected = current.connected;
@@ -2225,7 +2289,7 @@ bool BambuCloudClient::set_chamber_light(bool on) {
   }
   live_runtime_dirty_ = false;
   publish_combined_snapshot();
-  ESP_LOGI(kTag, "Cloud chamber light set to %s", on ? "on" : "off");
+  ESP_LOGI(kTag, "Cloud chamber light command queued: %s", on ? "on" : "off");
   return true;
 }
 
@@ -2240,7 +2304,7 @@ void BambuCloudClient::mqtt_event_handler(void* handler_args, esp_event_base_t b
 }
 
 void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
-  if (event == nullptr) {
+  if (event == nullptr || mqtt_client_ == nullptr || event->client != mqtt_client_) {
     return;
   }
 
@@ -2323,6 +2387,17 @@ void BambuCloudClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     case MQTT_EVENT_DATA: {
       std::string topic;
       std::string payload;
+      if (event->total_data_len <= 0 ||
+          static_cast<size_t>(event->total_data_len) > kMaxCloudMqttPayloadBytes) {
+        if (event->current_data_offset == 0) {
+          ESP_LOGW(kTag, "Dropping oversized cloud MQTT payload: %d bytes",
+                   event->total_data_len);
+        }
+        std::lock_guard<std::mutex> lock(incoming_mutex_);
+        incoming_topic_.clear();
+        incoming_payload_.clear();
+        break;
+      }
       {
         std::lock_guard<std::mutex> lock(incoming_mutex_);
         if (event->current_data_offset == 0) {
@@ -2392,6 +2467,7 @@ void BambuCloudClient::stop_mqtt_client() {
   received_live_payload_ = false;
   initial_sync_sent_ = false;
   delayed_start_sent_ = false;
+  chamber_light_command_pending_ = false;
   initial_sync_tick_ = 0;
   {
     std::lock_guard<std::mutex> lock(incoming_mutex_);
@@ -2400,12 +2476,62 @@ void BambuCloudClient::stop_mqtt_client() {
   }
   if (mqtt_client_ != nullptr) {
     esp_mqtt_client_stop(mqtt_client_);
+    vTaskDelay(pdMS_TO_TICKS(300));
     esp_mqtt_client_destroy(mqtt_client_);
     mqtt_client_ = nullptr;
+    log_heap_diag("cloud mqtt after client destroy");
   }
   mqtt_client_id_.clear();
   mqtt_report_topic_.clear();
   mqtt_request_topic_.clear();
+}
+
+bool BambuCloudClient::publish_chamber_light_command(bool on) {
+  if (mqtt_client_ == nullptr || !mqtt_connected_.load() ||
+      !mqtt_subscription_acknowledged_.load()) {
+    return false;
+  }
+
+  const BambuCloudSnapshot current = snapshot();
+  const bool supports_secondary = printer_model_has_secondary_chamber_light(current.model);
+
+  auto publish_ledctrl = [&](const char* node) {
+    const std::string payload = build_ledctrl_payload(node, on);
+    if (payload.empty()) {
+      return false;
+    }
+
+    const int msg_id =
+        esp_mqtt_client_publish(mqtt_client_, mqtt_request_topic_.c_str(), payload.c_str(), 0, 0, 0);
+    if (msg_id < 0) {
+      ESP_LOGW(kTag, "Failed to publish cloud chamber light command for %s", node);
+      return false;
+    }
+    return true;
+  };
+
+  const bool primary_ok = publish_ledctrl("chamber_light");
+  const bool secondary_ok = !supports_secondary || publish_ledctrl("chamber_light2");
+  if (primary_ok && secondary_ok) {
+    publish_request(kPushAll);
+    return true;
+  }
+  return false;
+}
+
+void BambuCloudClient::process_pending_chamber_light_command() {
+  if (!chamber_light_command_pending_.load() || mqtt_client_ == nullptr ||
+      !mqtt_connected_.load() || !mqtt_subscription_acknowledged_.load()) {
+    return;
+  }
+
+  const bool on = chamber_light_command_on_.load();
+  chamber_light_command_pending_ = false;
+  if (publish_chamber_light_command(on)) {
+    ESP_LOGI(kTag, "Cloud chamber light command published: %s", on ? "on" : "off");
+  } else {
+    ESP_LOGW(kTag, "Cloud chamber light command publish failed");
+  }
 }
 
 bool BambuCloudClient::ensure_cloud_mqtt_identity() {
@@ -2515,11 +2641,14 @@ bool BambuCloudClient::ensure_mqtt_client_started() {
   mqtt_cfg.network.timeout_ms = 10000;
   mqtt_cfg.network.reconnect_timeout_ms = 15000;
 
+  log_heap_diag("cloud mqtt before client init");
   mqtt_client_ = esp_mqtt_client_init(&mqtt_cfg);
   if (mqtt_client_ == nullptr) {
     ESP_LOGW(kTag, "Failed to create Bambu Cloud MQTT client");
+    log_heap_diag("cloud mqtt client init failed");
     return false;
   }
+  log_heap_diag("cloud mqtt after client init");
 
   esp_mqtt_client_register_event(mqtt_client_, MQTT_EVENT_ANY,
                                  &BambuCloudClient::mqtt_event_handler, this);
@@ -2527,8 +2656,10 @@ bool BambuCloudClient::ensure_mqtt_client_started() {
     ESP_LOGW(kTag, "Failed to start Bambu Cloud MQTT client");
     esp_mqtt_client_destroy(mqtt_client_);
     mqtt_client_ = nullptr;
+    log_heap_diag("cloud mqtt client start failed");
     return false;
   }
+  log_heap_diag("cloud mqtt after client start");
 
   ESP_LOGI(kTag, "Connecting to Bambu Cloud MQTT %s:%u (serial=%s, user=%s)", mqtt_host,
            static_cast<unsigned int>(kCloudMqttPort), serial.c_str(), mqtt_username_.c_str());
@@ -3105,6 +3236,8 @@ void BambuCloudClient::task_loop() {
   bool last_preview_fetch_enabled = false;
   bool last_preview_active_print = false;
   TickType_t last_binding_fetch_tick = 0;
+  uint32_t cloud_initial_sync_failures = 0;
+  TickType_t cloud_mqtt_restart_not_before_tick = 0;
   while (true) {
     if (live_runtime_dirty_.exchange(false)) {
       publish_combined_snapshot();
@@ -3113,14 +3246,35 @@ void BambuCloudClient::task_loop() {
       publish_combined_snapshot();
     }
 
-    if (reload_requested_.exchange(false) && config_store_ != nullptr) {
-      stop_mqtt_client();
-      configure(config_store_->load_cloud_credentials(), config_store_->load_active_printer_profile().serial);
+    if (reconfigure_requested_.exchange(false)) {
+      BambuCloudCredentials credentials;
+      std::string printer_serial;
+      {
+        std::lock_guard<std::mutex> lock(pending_config_mutex_);
+        credentials = std::move(pending_credentials_);
+        printer_serial = std::move(pending_printer_serial_);
+      }
+      apply_configuration(std::move(credentials), std::move(printer_serial));
       last_preview_fetch_tick = 0;
       preview_retry_not_before_tick = 0;
       last_preview_fetch_enabled = false;
       last_preview_active_print = false;
       last_binding_fetch_tick = 0;
+      cloud_initial_sync_failures = 0;
+      cloud_mqtt_restart_not_before_tick = 0;
+      continue;
+    }
+
+    if (reload_requested_.exchange(false) && config_store_ != nullptr) {
+      apply_configuration(config_store_->load_cloud_credentials(),
+                          config_store_->load_active_printer_profile().serial);
+      last_preview_fetch_tick = 0;
+      preview_retry_not_before_tick = 0;
+      last_preview_fetch_enabled = false;
+      last_preview_active_print = false;
+      last_binding_fetch_tick = 0;
+      cloud_initial_sync_failures = 0;
+      cloud_mqtt_restart_not_before_tick = 0;
     }
 
     if (mqtt_auth_recovery_requested_.exchange(false)) {
@@ -3166,11 +3320,16 @@ void BambuCloudClient::task_loop() {
       continue;
     }
 
-    while (!network_ready_.load()) {
+    while (!network_ready_.load() && !reconfigure_requested_.load() &&
+           !reload_requested_.load() && !mqtt_auth_recovery_requested_.load()) {
       stop_mqtt_client();
       apply_cloud_session_state(true, false, false, false,
                                 "Waiting for Wi-Fi for Bambu Cloud", false, true);
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+    }
+    if (reconfigure_requested_.load() || reload_requested_.load() ||
+        mqtt_auth_recovery_requested_.load()) {
+      continue;
     }
 
     const int64_t now_us = esp_timer_get_time();
@@ -3207,7 +3366,8 @@ void BambuCloudClient::task_loop() {
         const TickType_t retry_delay =
             waiting_for_user_code() ? pdMS_TO_TICKS(1000) : pdMS_TO_TICKS(15000);
         TickType_t waited = 0;
-        while (waited < retry_delay && !reload_requested_.load()) {
+        while (waited < retry_delay && !reload_requested_.load() &&
+               !reconfigure_requested_.load()) {
           constexpr TickType_t kRetrySlice = pdMS_TO_TICKS(1000);
           const TickType_t remaining = retry_delay - waited;
           const TickType_t slice = remaining < kRetrySlice ? remaining : kRetrySlice;
@@ -3223,10 +3383,21 @@ void BambuCloudClient::task_loop() {
       stop_mqtt_client();
       mqtt_connected_ = false;
       mqtt_subscription_acknowledged_ = false;
+      cloud_mqtt_restart_not_before_tick = 0;
     } else if (!ensure_cloud_mqtt_identity()) {
       mqtt_connected_ = false;
       mqtt_subscription_acknowledged_ = false;
     } else {
+      const TickType_t now_tick_for_restart = xTaskGetTickCount();
+      if (cloud_mqtt_restart_not_before_tick != 0 &&
+          static_cast<int32_t>(cloud_mqtt_restart_not_before_tick - now_tick_for_restart) > 0) {
+        const TickType_t remaining = cloud_mqtt_restart_not_before_tick - now_tick_for_restart;
+        const TickType_t wait_slice =
+            remaining > pdMS_TO_TICKS(1000) ? pdMS_TO_TICKS(1000) : remaining;
+        ulTaskNotifyTake(pdTRUE, wait_slice);
+        continue;
+      }
+      cloud_mqtt_restart_not_before_tick = 0;
       ensure_mqtt_client_started();
     }
 
@@ -3238,6 +3409,10 @@ void BambuCloudClient::task_loop() {
         live_mqtt_enabled && mqtt_connected_.load() && mqtt_subscription_acknowledged_.load() &&
         initial_sync_sent_.load() && !received_live_payload_.load();
     const uint32_t initial_sync_tick = initial_sync_tick_.load();
+    if (received_live_payload_.load()) {
+      cloud_initial_sync_failures = 0;
+      cloud_mqtt_restart_not_before_tick = 0;
+    }
     if (waiting_for_live_payload && initial_sync_tick != 0 &&
         static_cast<TickType_t>(now_tick - initial_sync_tick) >= kCloudInitialSyncRetryDelay &&
         !delayed_start_sent_.load()) {
@@ -3247,11 +3422,18 @@ void BambuCloudClient::task_loop() {
     }
     if (waiting_for_live_payload && initial_sync_tick != 0 && delayed_start_sent_.load() &&
         static_cast<TickType_t>(now_tick - initial_sync_tick) >= kCloudInitialSyncTimeout) {
-      ESP_LOGW(kTag, "Still no cloud status payload after delayed pushall, restarting cloud MQTT");
+      ++cloud_initial_sync_failures;
+      const TickType_t backoff = cloud_initial_sync_backoff(cloud_initial_sync_failures);
+      cloud_mqtt_restart_not_before_tick = now_tick + backoff;
+      ESP_LOGW(kTag,
+               "Still no cloud status payload after delayed pushall, restarting cloud MQTT "
+               "after %u ms backoff",
+               static_cast<unsigned>(backoff * portTICK_PERIOD_MS));
       stop_mqtt_client();
       ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       continue;
     }
+    process_pending_chamber_light_command();
     const TickType_t status_poll_interval =
         low_power ? kCloudStatusPollLowPower : kCloudStatusPollIdle;
     const bool initial_preview_window_open =
@@ -4023,8 +4205,7 @@ bool BambuCloudClient::fetch_latest_preview(bool allow_preview_download) {
     cached_preview_blob_ = download_preview_image(selected_cover);
     if (cached_preview_blob_ != nullptr) {
       cached_preview_url_ = selected_preview_key;
-      ESP_LOGI(kTag, "Preview image cached in memory: %u bytes",
-               static_cast<unsigned int>(cached_preview_blob_->size()));
+      log_blob_diag("cloud preview cached", cached_preview_blob_);
     } else {
       ESP_LOGW(kTag, "Cloud preview download failed");
     }
@@ -4048,8 +4229,10 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
     return nullptr;
   }
 
+  log_heap_diag("cloud preview download start");
+
   auto blob = std::make_shared<std::vector<uint8_t>>();
-  blob->reserve(16 * 1024);
+  blob->reserve(kPreviewPersistentReserveBytes);
 
   PreviewDownloadContext download_context = {
       .buffer = blob.get(),
@@ -4114,15 +4297,17 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
                esp_err_to_name(perform_err), complete ? "true" : "false",
                static_cast<unsigned int>(blob->size()));
     } else if (!blob->empty()) {
+      log_blob_diag("cloud preview direct response", blob);
       return blob;
     }
   }
 
   auto ranged_blob = std::make_shared<std::vector<uint8_t>>();
   if (content_length > 0 && content_length <= static_cast<int64_t>(kMaxPreviewBytes)) {
-    ranged_blob->reserve(static_cast<size_t>(content_length));
+    ranged_blob->reserve(std::max(static_cast<size_t>(content_length),
+                                  kPreviewPersistentReserveBytes));
   } else {
-    ranged_blob->reserve(16 * 1024);
+    ranged_blob->reserve(kPreviewPersistentReserveBytes);
   }
 
   PreviewDownloadContext range_context = {
@@ -4217,6 +4402,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
   if (!range_failed && !ranged_blob->empty()) {
     ESP_LOGI(kTag, "Preview image fetched via HTTP ranges: %u bytes",
              static_cast<unsigned int>(ranged_blob->size()));
+    log_blob_diag("cloud preview ranged response", ranged_blob);
     return ranged_blob;
   }
 
@@ -4266,7 +4452,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
   }
 
   std::vector<uint8_t> response;
-  response.reserve(16 * 1024);
+  response.reserve(kPreviewPersistentReserveBytes);
   char read_buffer[1024];
   while (response.size() < (kMaxPreviewBytes + 8192)) {
     const ssize_t read = esp_tls_conn_read(tls, read_buffer, sizeof(read_buffer));
@@ -4322,8 +4508,11 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
     }
   }
 
-  auto fallback_blob = std::make_shared<std::vector<uint8_t>>(
-      response.begin() + static_cast<ptrdiff_t>(header_size), response.end());
+  auto fallback_blob = std::make_shared<std::vector<uint8_t>>();
+  const auto body_begin = response.begin() + static_cast<ptrdiff_t>(header_size);
+  fallback_blob->reserve(std::max(static_cast<size_t>(std::distance(body_begin, response.end())),
+                                  kPreviewPersistentReserveBytes));
+  fallback_blob->insert(fallback_blob->end(), body_begin, response.end());
   if (fallback_blob->empty()) {
     ESP_LOGW(kTag, "Preview TLS fallback body empty");
     return nullptr;
@@ -4338,6 +4527,7 @@ std::shared_ptr<std::vector<uint8_t>> BambuCloudClient::download_preview_image(c
 
   ESP_LOGI(kTag, "Preview image fetched via raw TLS fallback: %u bytes",
            static_cast<unsigned int>(fallback_blob->size()));
+  log_blob_diag("cloud preview tls fallback response", fallback_blob);
   return fallback_blob;
 }
 
@@ -4412,6 +4602,14 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
   }
 
   *status_code = esp_http_client_get_status_code(client);
+  const int64_t content_length = esp_http_client_get_content_length(client);
+  if (content_length > static_cast<int64_t>(kMaxJsonResponseBytes)) {
+    ESP_LOGW(kTag, "HTTP JSON response too large for %s: %lld bytes",
+             url.c_str(), content_length);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return false;
+  }
   constexpr int64_t kMaxReadDurationUs = 20 * 1000 * 1000;  // 20s total read deadline
   const int64_t read_start_us = esp_timer_get_time();
   char buffer[1024];
@@ -4432,6 +4630,12 @@ bool BambuCloudClient::perform_json_request(const std::string& url, const char* 
     }
     if (read == 0) {
       break;
+    }
+    if (response_body->size() + static_cast<size_t>(read) > kMaxJsonResponseBytes) {
+      ESP_LOGW(kTag, "HTTP JSON response exceeded cap for %s", url.c_str());
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      return false;
     }
     response_body->append(buffer, read);
   }

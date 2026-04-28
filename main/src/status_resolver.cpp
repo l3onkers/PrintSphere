@@ -279,6 +279,85 @@ PrinterModel preferred_model_for_routing(const PrinterSnapshot& local_snapshot,
   return local_snapshot.local_model;
 }
 
+struct StatusSourceAdapter {
+  FieldSource source = FieldSource::kNone;
+  bool enabled = false;
+  bool fresh = false;
+  bool status_supported = false;
+  bool metrics_supported = false;
+  bool temperatures_supported = false;
+  bool error_supported = false;
+  bool status_usable = false;
+  bool metrics_usable = false;
+  bool temperatures_usable = false;
+  bool light_usable = false;
+  bool error_usable = false;
+  bool ams_usable = false;
+};
+
+StatusSourceAdapter make_local_source_adapter(const PrinterSnapshot& snapshot, bool enabled,
+                                              PrinterModel routing_model, uint64_t now_ms) {
+  StatusSourceAdapter adapter;
+  adapter.source = FieldSource::kLocal;
+  adapter.enabled = enabled;
+  adapter.fresh = enabled && snapshot.local_connected &&
+                  is_recent_enough(snapshot.local_last_update_ms, now_ms, kLocalSourceFreshMs);
+  adapter.status_supported = enabled && printer_model_supports_local_status(routing_model);
+  adapter.metrics_supported = adapter.status_supported;
+  adapter.temperatures_supported = adapter.status_supported;
+  adapter.error_supported = adapter.status_supported;
+  adapter.status_usable =
+      adapter.status_supported && adapter.fresh && local_state_has_priority_signal(snapshot);
+  adapter.metrics_usable =
+      adapter.metrics_supported && adapter.fresh && local_metrics_have_signal(snapshot);
+  adapter.temperatures_usable =
+      adapter.temperatures_supported && adapter.fresh && snapshot.local_capabilities.temperatures;
+  adapter.light_usable = adapter.status_supported && adapter.fresh &&
+                         snapshot.chamber_light_supported && snapshot.chamber_light_state_known;
+  adapter.error_usable =
+      adapter.error_supported && adapter.fresh &&
+      (snapshot.print_error_code != 0 || !snapshot.hms_codes.empty() ||
+       snapshot.hms_alert_count > 0 || snapshot.non_error_stop || snapshot.has_error);
+  adapter.ams_usable = adapter.fresh && (snapshot.ams != nullptr) && snapshot.ams->count > 0;
+  return adapter;
+}
+
+StatusSourceAdapter make_cloud_source_adapter(const BambuCloudSnapshot& snapshot, bool enabled,
+                                              uint64_t now_ms) {
+  StatusSourceAdapter adapter;
+  adapter.source = FieldSource::kCloud;
+  adapter.enabled = enabled;
+  adapter.fresh = enabled && snapshot.connected &&
+                  is_recent_enough(snapshot.last_update_ms, now_ms, kCloudSourceFreshMs);
+  adapter.status_supported =
+      enabled && (snapshot.capabilities.status || cloud_state_has_signal(snapshot));
+  adapter.metrics_supported =
+      enabled && (snapshot.capabilities.metrics || cloud_metrics_have_signal(snapshot));
+  adapter.temperatures_supported = enabled && snapshot.capabilities.temperatures;
+  adapter.error_supported =
+      enabled && (snapshot.capabilities.hms || snapshot.capabilities.print_error ||
+                  snapshot.print_error_code != 0 || !snapshot.hms_codes.empty() ||
+                  snapshot.hms_alert_count > 0 || snapshot.has_error || snapshot.non_error_stop);
+  adapter.status_usable =
+      adapter.status_supported && adapter.fresh && cloud_state_has_signal(snapshot);
+  adapter.metrics_usable =
+      adapter.metrics_supported && adapter.fresh && cloud_metrics_have_signal(snapshot);
+  adapter.temperatures_usable =
+      adapter.temperatures_supported && adapter.fresh &&
+      (cloud_temperature_known(snapshot.nozzle_temp_last_update_ms, snapshot.connected) ||
+       cloud_temperature_known(snapshot.bed_temp_last_update_ms, snapshot.connected) ||
+       cloud_temperature_known(snapshot.chamber_temp_last_update_ms, snapshot.connected) ||
+       cloud_temperature_known(snapshot.secondary_nozzle_temp_last_update_ms, snapshot.connected));
+  adapter.light_usable =
+      adapter.fresh && snapshot.chamber_light_supported && snapshot.chamber_light_state_known;
+  adapter.error_usable =
+      adapter.error_supported && adapter.fresh &&
+      (snapshot.print_error_code != 0 || !snapshot.hms_codes.empty() ||
+       snapshot.hms_alert_count > 0 || snapshot.has_error || snapshot.non_error_stop);
+  adapter.ams_usable = adapter.fresh && (snapshot.ams != nullptr) && snapshot.ams->count > 0;
+  return adapter;
+}
+
 void copy_source_metadata(PrinterSnapshot& target, const PrinterSnapshot& local_snapshot,
                           bool local_printer_enabled, const BambuCloudSnapshot& cloud_snapshot,
                           bool wifi_connected, const std::string& wifi_ip) {
@@ -792,10 +871,7 @@ void resolve_ui_state(PrinterSnapshot& snapshot) {
 PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool local_printer_enabled,
                                      const BambuCloudSnapshot& cloud_snapshot,
                                      SourceMode source_mode, uint64_t now_ms,
-                                     bool wifi_connected, const std::string& wifi_ip,
-                                     bool print_activity_seen_this_session) {
-  (void)print_activity_seen_this_session;
-
+                                     bool wifi_connected, const std::string& wifi_ip) {
   PrinterSnapshot snapshot;
   const bool local_enabled = source_mode != SourceMode::kCloudOnly && local_printer_enabled;
   const bool cloud_enabled = source_mode != SourceMode::kLocalOnly && cloud_snapshot.configured;
@@ -806,76 +882,42 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
 
   const PrinterModel routing_model =
       preferred_model_for_routing(local_snapshot, cloud_snapshot);
-  const bool local_status_supported =
-      local_enabled && printer_model_supports_local_status(routing_model);
-  const bool local_metrics_supported = local_status_supported;
-  const bool local_temperatures_supported = local_status_supported;
-  const bool local_error_supported = local_status_supported;
   const bool prefer_cloud_status =
       source_mode == SourceMode::kHybrid &&
       printer_model_prefers_cloud_status(routing_model);
 
-  const bool local_fresh =
-      local_enabled && local_snapshot.local_connected &&
-      is_recent_enough(local_snapshot.local_last_update_ms, now_ms, kLocalSourceFreshMs);
-  const bool cloud_fresh =
-      cloud_enabled && cloud_snapshot.connected &&
-      is_recent_enough(cloud_snapshot.last_update_ms, now_ms, kCloudSourceFreshMs);
-  const bool cloud_status_usable = cloud_fresh && cloud_state_has_signal(cloud_snapshot);
-  const bool cloud_metrics_usable = cloud_fresh && cloud_metrics_have_signal(cloud_snapshot);
-  const bool cloud_temperatures_usable =
-      cloud_fresh && cloud_snapshot.capabilities.temperatures &&
-      (cloud_temperature_known(cloud_snapshot.nozzle_temp_last_update_ms, cloud_snapshot.connected) ||
-       cloud_temperature_known(cloud_snapshot.bed_temp_last_update_ms, cloud_snapshot.connected) ||
-       cloud_temperature_known(cloud_snapshot.chamber_temp_last_update_ms, cloud_snapshot.connected) ||
-       cloud_temperature_known(cloud_snapshot.secondary_nozzle_temp_last_update_ms,
-                               cloud_snapshot.connected));
-  const bool cloud_light_usable =
-      cloud_fresh && cloud_snapshot.chamber_light_supported &&
-      cloud_snapshot.chamber_light_state_known;
-  const bool cloud_error_usable =
-      cloud_fresh && (cloud_snapshot.print_error_code != 0 || !cloud_snapshot.hms_codes.empty() ||
-                      cloud_snapshot.hms_alert_count > 0 ||
-                      cloud_snapshot.has_error || cloud_snapshot.non_error_stop);
-  const bool local_status_usable =
-      local_status_supported && local_fresh && local_state_has_priority_signal(local_snapshot) &&
-      (!prefer_cloud_status || !cloud_status_usable);
-  const bool local_metrics_usable =
-      local_metrics_supported && local_fresh && local_metrics_have_signal(local_snapshot) &&
-      (!prefer_cloud_status || !cloud_metrics_usable);
-  const bool local_temperatures_usable =
-      local_temperatures_supported && local_fresh && local_snapshot.local_capabilities.temperatures &&
-      (!prefer_cloud_status || !cloud_temperatures_usable);
-  const bool local_light_usable =
-      local_status_supported && local_fresh && local_snapshot.chamber_light_supported &&
-      local_snapshot.chamber_light_state_known &&
-      (!prefer_cloud_status || !cloud_light_usable);
-  const bool local_error_usable =
-      local_error_supported && local_fresh &&
-      (local_snapshot.print_error_code != 0 || !local_snapshot.hms_codes.empty() ||
-       local_snapshot.hms_alert_count > 0 ||
-       local_snapshot.non_error_stop || local_snapshot.has_error) &&
-      (!prefer_cloud_status || !cloud_error_usable);
+  StatusSourceAdapter local_source =
+      make_local_source_adapter(local_snapshot, local_enabled, routing_model, now_ms);
+  const StatusSourceAdapter cloud_source =
+      make_cloud_source_adapter(cloud_snapshot, cloud_enabled, now_ms);
+  if (prefer_cloud_status) {
+    local_source.status_usable = local_source.status_usable && !cloud_source.status_usable;
+    local_source.metrics_usable = local_source.metrics_usable && !cloud_source.metrics_usable;
+    local_source.temperatures_usable =
+        local_source.temperatures_usable && !cloud_source.temperatures_usable;
+    local_source.light_usable = local_source.light_usable && !cloud_source.light_usable;
+    local_source.error_usable = local_source.error_usable && !cloud_source.error_usable;
+  }
 
-  if (local_status_usable) {
+  if (local_source.status_usable) {
     snapshot.status_source = FieldSource::kLocal;
     apply_local_status_bundle(snapshot, local_snapshot);
-  } else if (cloud_status_usable) {
+  } else if (cloud_source.status_usable) {
     snapshot.status_source = FieldSource::kCloud;
     apply_cloud_status_bundle(snapshot, cloud_snapshot);
   }
 
-  if (local_metrics_usable) {
+  if (local_source.metrics_usable) {
     snapshot.metrics_source = FieldSource::kLocal;
     apply_local_metrics_bundle(snapshot, local_snapshot);
-  } else if (cloud_metrics_usable) {
+  } else if (cloud_source.metrics_usable) {
     snapshot.metrics_source = FieldSource::kCloud;
     apply_cloud_metrics_bundle(snapshot, cloud_snapshot);
   }
 
-  if (local_temperatures_usable) {
+  if (local_source.temperatures_usable) {
     apply_local_temperature_bundle(snapshot, local_snapshot);
-  } else if (cloud_temperatures_usable) {
+  } else if (cloud_source.temperatures_usable) {
     apply_cloud_temperature_bundle(snapshot, cloud_snapshot, now_ms);
   }
   snapshot.chamber_light_supported =
@@ -883,30 +925,25 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
       (cloud_enabled && cloud_snapshot.chamber_light_supported);
   snapshot.chamber_light_state_known = false;
   snapshot.chamber_light_on = false;
-  if (local_light_usable) {
+  if (local_source.light_usable) {
     snapshot.chamber_light_state_known = true;
     snapshot.chamber_light_on = local_snapshot.chamber_light_on;
-  } else if (cloud_light_usable) {
+  } else if (cloud_source.light_usable) {
     snapshot.chamber_light_state_known = true;
     snapshot.chamber_light_on = cloud_snapshot.chamber_light_on;
   }
-  if (local_error_usable) {
+  if (local_source.error_usable) {
     apply_local_error_bundle(snapshot, local_snapshot);
-  } else if (cloud_error_usable) {
+  } else if (cloud_source.error_usable) {
     apply_cloud_error_bundle(snapshot, cloud_snapshot);
   }
 
-  const bool local_ams_usable =
-      local_fresh && (local_snapshot.ams != nullptr) && local_snapshot.ams->count > 0;
-  const bool cloud_ams_usable =
-      cloud_fresh && (cloud_snapshot.ams != nullptr) && cloud_snapshot.ams->count > 0;
-
-  if (local_ams_usable) {
+  if (local_source.ams_usable) {
     snapshot.hw_switch_state = local_snapshot.hw_switch_state;
     snapshot.tray_now = local_snapshot.tray_now;
     snapshot.tray_tar = local_snapshot.tray_tar;
     snapshot.ams = local_snapshot.ams;
-  } else if (cloud_ams_usable) {
+  } else if (cloud_source.ams_usable) {
     snapshot.hw_switch_state = cloud_snapshot.hw_switch_state;
     snapshot.tray_now = cloud_snapshot.tray_now;
     snapshot.tray_tar = cloud_snapshot.tray_tar;
@@ -921,10 +958,12 @@ PrinterSnapshot merge_status_sources(const PrinterSnapshot& local_snapshot, bool
     snapshot.camera_source = FieldSource::kLocal;
   }
 
-  if (snapshot.job_name.empty() && !local_snapshot.job_name.empty() && local_metrics_usable) {
+  if (snapshot.job_name.empty() && !local_snapshot.job_name.empty() &&
+      local_source.metrics_usable) {
     snapshot.job_name = local_snapshot.job_name;
   }
-  if (snapshot.job_name.empty() && !cloud_snapshot.preview_title.empty() && cloud_metrics_usable) {
+  if (snapshot.job_name.empty() && !cloud_snapshot.preview_title.empty() &&
+      cloud_source.metrics_usable) {
     snapshot.job_name = cloud_snapshot.preview_title;
   }
 
