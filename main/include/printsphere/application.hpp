@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "printsphere/bambu_cloud_client.hpp"
 #include "printsphere/config_store.hpp"
 #include "printsphere/p1s_camera_client.hpp"
@@ -37,6 +39,7 @@ class Application {
   bool hybrid_cloud_gate_open_ = false;
   TickType_t hybrid_cloud_gate_deadline_ = 0;
   TickType_t hybrid_camera_cooldown_deadline_ = 0;
+  std::atomic<TickType_t> local_mqtt_handoff_until_tick_{0};
   bool filament_wake_enabled_ = false;
   bool filament_anim_enabled_ = true;
   bool chamber_light_override_active_ = false;

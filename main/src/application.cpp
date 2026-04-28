@@ -20,6 +20,7 @@ constexpr TickType_t kStopBannerDuration = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCloudFallbackDelayLocalFirst = pdMS_TO_TICKS(35000);
 constexpr TickType_t kHybridCloudFallbackDelayCloudFirst = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
+constexpr TickType_t kLocalMqttHandoffCooldown = pdMS_TO_TICKS(3000);
 constexpr TickType_t kScreenOffTouchWakePollSlice = pdMS_TO_TICKS(25);
 constexpr uint64_t kChamberLightOverrideMs = 6000;
 
@@ -170,6 +171,14 @@ Application::Application()
   // the printer is powered off or roaming on the LAN.
   cloud_client_.set_printer_presence_callback(
       [this](bool online) { printer_client_.notify_cloud_presence(online); });
+  printer_client_.set_pre_local_mqtt_callback([this]() -> uint32_t {
+    ESP_LOGI(kTag, "Local MQTT handoff: pausing cloud live MQTT and camera before TLS start");
+    local_mqtt_handoff_until_tick_ = xTaskGetTickCount() + kLocalMqttHandoffCooldown;
+    cloud_client_.set_live_mqtt_enabled(false);
+    cloud_client_.set_fetch_paused(true);
+    camera_client_.set_enabled(false);
+    return 650U;
+  });
 }
 
 void Application::run() {
@@ -259,12 +268,16 @@ void Application::run() {
     const bool camera_page_active = ui_.is_camera_page_active();
     source_mode_ = config_store_.load_source_mode();
     const bool local_network_ready = wifi_connected && source_mode_ != SourceMode::kCloudOnly;
+    const bool local_mqtt_handoff_active =
+        tick_deadline_active(local_mqtt_handoff_until_tick_.load(), now_tick);
     printer_client_.set_network_ready(local_network_ready);
     camera_client_.set_network_ready(local_network_ready);
     local_printer_enabled_ = printer_client_.is_configured();
+    PrinterSnapshot local_snapshot = printer_client_.snapshot();
     const bool camera_page_visible = ui_.is_camera_page_visible();
     const bool camera_enabled =
         source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
+        local_snapshot.local_connected && !local_mqtt_handoff_active &&
         (camera_page_active || (page_transition_active && camera_page_visible)) &&
         ui_.screen_power_mode() != ScreenPowerMode::kOff;
     camera_client_.set_enabled(camera_enabled);
@@ -272,7 +285,6 @@ void Application::run() {
       camera_client_.request_refresh();
     }
 
-    PrinterSnapshot local_snapshot = printer_client_.snapshot();
     local_snapshot.wifi_connected = wifi_connected;
     local_snapshot.wifi_ip = wifi_ip;
     local_snapshot.setup_ap_active = wifi_manager_.is_setup_access_point_active();
@@ -354,13 +366,14 @@ void Application::run() {
     }
     const bool cloud_live_mqtt_enabled =
         cloud_network_ready &&
+        !local_mqtt_handoff_active &&
         (source_mode_ == SourceMode::kCloudOnly ||
          (source_mode_ == SourceMode::kHybrid &&
           (hybrid_prefers_cloud || !hybrid_local_path_healthy)));
     const bool pause_cloud_fetches =
         source_mode_ == SourceMode::kHybrid &&
         (camera_page_active || page_transition_active || hybrid_camera_cooldown_active ||
-         !cloud_network_ready);
+         local_mqtt_handoff_active || !cloud_network_ready);
     cloud_client_.set_network_ready(cloud_network_ready);
     cloud_client_.set_live_mqtt_enabled(cloud_live_mqtt_enabled);
     cloud_client_.set_fetch_paused(pause_cloud_fetches);

@@ -2376,6 +2376,23 @@ void PrinterClient::notify_cloud_presence(bool online) {
   wake_task();
 }
 
+void PrinterClient::set_pre_local_mqtt_callback(std::function<uint32_t()> cb) {
+  std::lock_guard<std::mutex> lock(pre_local_mqtt_mutex_);
+  pre_local_mqtt_callback_ = std::move(cb);
+}
+
+uint32_t PrinterClient::prepare_for_local_mqtt_start() {
+  std::function<uint32_t()> cb;
+  {
+    std::lock_guard<std::mutex> lock(pre_local_mqtt_mutex_);
+    cb = pre_local_mqtt_callback_;
+  }
+  if (!cb) {
+    return 0;
+  }
+  return cb();
+}
+
 void PrinterClient::set_network_ready(bool ready) {
   const bool previous = network_ready_.exchange(ready);
   if (ready && !previous) {
@@ -2614,6 +2631,13 @@ void PrinterClient::task_loop() {
                    connection.host.c_str());
           consecutive_probe_failures_ = 0;
         }
+      }
+
+      const uint32_t handoff_delay_ms = prepare_for_local_mqtt_start();
+      if (handoff_delay_ms > 0) {
+        ESP_LOGI(kTag, "Waiting %ums before local MQTT TLS start",
+                 static_cast<unsigned>(handoff_delay_ms));
+        vTaskDelay(pdMS_TO_TICKS(handoff_delay_ms));
       }
 
       esp_mqtt_client_config_t mqtt_cfg = {};

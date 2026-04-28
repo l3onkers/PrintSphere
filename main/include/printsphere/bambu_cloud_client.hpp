@@ -174,7 +174,12 @@ class BambuCloudClient {
   }
   void set_low_power_mode(bool enabled) { low_power_mode_.store(enabled); }
   void set_fetch_paused(bool paused);
-  void set_live_mqtt_enabled(bool enabled) { live_mqtt_enabled_.store(enabled); }
+  void set_live_mqtt_enabled(bool enabled) {
+    const bool previous = live_mqtt_enabled_.exchange(enabled);
+    if (previous != enabled && task_handle_ != nullptr) {
+      xTaskNotifyGive(task_handle_);
+    }
+  }
   void set_preview_fetch_enabled(bool enabled);
   void request_reload_from_store() {
     reload_requested_.store(true);

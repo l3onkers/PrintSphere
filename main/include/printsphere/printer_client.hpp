@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 
@@ -34,6 +35,9 @@ class PrinterClient {
   // on `client.disconnected` for logging / future offline handling. Safe to
   // call from the cloud MQTT task context; only touches atomics.
   void notify_cloud_presence(bool online);
+  // Called immediately before the local MQTT client allocates/starts its TLS stack.
+  // Return a short delay in ms when other network clients need time to unwind.
+  void set_pre_local_mqtt_callback(std::function<uint32_t()> cb);
   bool set_chamber_light(bool on);
   esp_err_t start();
   PrinterSnapshot snapshot() const { return state_.snapshot(); }
@@ -117,10 +121,13 @@ class PrinterClient {
   void publish_runtime_snapshot();
   PrinterSnapshot build_snapshot_from_runtime(const LocalPrinterRuntimeState& runtime) const;
   void wake_task();
+  uint32_t prepare_for_local_mqtt_start();
 
   mutable std::mutex config_mutex_{};
   PrinterConnection desired_connection_{};
   PrinterConnection active_connection_{};
+  mutable std::mutex pre_local_mqtt_mutex_{};
+  std::function<uint32_t()> pre_local_mqtt_callback_{};
   PrinterStateStore state_{};
   mutable std::mutex runtime_mutex_{};
   LocalPrinterRuntimeState runtime_state_{};
