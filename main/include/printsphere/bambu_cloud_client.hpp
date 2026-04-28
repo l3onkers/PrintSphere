@@ -15,6 +15,7 @@
 #include "mqtt_client.h"
 #include "printsphere/config_store.hpp"
 #include "printsphere/printer_state.hpp"
+#include "printsphere/resource_arbiter.hpp"
 
 struct cJSON;
 
@@ -161,6 +162,7 @@ class BambuCloudClient {
   };
 
   void set_config_store(const ConfigStore* config_store) { config_store_ = config_store; }
+  void set_resource_arbiter(ResourceArbiter* arbiter) { resource_arbiter_ = arbiter; }
   void configure(BambuCloudCredentials credentials, std::string printer_serial);
   void set_network_ready(bool ready) { network_ready_.store(ready); }
   // Invoked whenever a `client.connected` / `client.disconnected` event for the
@@ -222,7 +224,8 @@ class BambuCloudClient {
   void handle_report_payload(const char* payload, size_t length);
   bool fetch_bindings();
   bool fetch_latest_preview(bool allow_preview_download);
-  std::shared_ptr<std::vector<uint8_t>> download_preview_image(const std::string& url);
+  std::shared_ptr<std::vector<uint8_t>> download_preview_image(const std::string& url,
+                                                               bool* deferred);
   bool request_email_verification_code();
   bool request_sms_verification_code();
   bool request_verification_code();
@@ -280,6 +283,8 @@ class BambuCloudClient {
   BambuCloudCredentials pending_credentials_{};
   std::string pending_printer_serial_{};
   const ConfigStore* config_store_ = nullptr;
+  ResourceArbiter* resource_arbiter_ = nullptr;
+  ResourceArbiter::Lease cloud_mqtt_lease_{};
   BambuCloudCredentials credentials_{};
   std::string requested_serial_{};
   std::string resolved_serial_{};

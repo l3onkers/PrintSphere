@@ -22,7 +22,23 @@ constexpr TickType_t kHybridCloudFallbackDelayCloudFirst = pdMS_TO_TICKS(12000);
 constexpr TickType_t kHybridCameraCloudCooldown = pdMS_TO_TICKS(8000);
 constexpr TickType_t kLocalMqttHandoffCooldown = pdMS_TO_TICKS(3000);
 constexpr TickType_t kScreenOffTouchWakePollSlice = pdMS_TO_TICKS(25);
+constexpr size_t kLocalMqttStartMinInternalLargest = 16U * 1024U;
+constexpr size_t kLocalMqttStartMinDmaLargest = 16U * 1024U;
+constexpr size_t kCameraStartMinInternalLargest = 12U * 1024U;
+constexpr size_t kCameraStartMinDmaLargest = 12U * 1024U;
+constexpr size_t kPreviewFetchMinInternalLargest = 4U * 1024U;
+constexpr size_t kPreviewFetchMinDmaLargest = 4U * 1024U;
 constexpr uint64_t kChamberLightOverrideMs = 6000;
+constexpr uint32_t kSourceFreshMs = 15000;
+constexpr uint32_t kSourceRecentMs = 60000;
+constexpr uint32_t kSourceOldMs = 180000;
+
+struct SourceConfidence {
+  uint8_t local_score = 0;
+  uint8_t cloud_score = 0;
+  uint32_t local_age_ms = UINT32_MAX;
+  uint32_t cloud_age_ms = UINT32_MAX;
+};
 
 esp_err_t configure_power_management() {
 #if CONFIG_PM_ENABLE
@@ -52,6 +68,209 @@ bool cloud_print_is_live(const BambuCloudSnapshot& snapshot) {
 
 bool tick_deadline_active(TickType_t deadline, TickType_t now) {
   return deadline != 0 && static_cast<int32_t>(deadline - now) > 0;
+}
+
+const char* to_string(DominantLane lane) {
+  switch (lane) {
+    case DominantLane::kStatus:
+      return "status";
+    case DominantLane::kPreview:
+      return "preview";
+    case DominantLane::kCamera:
+      return "camera";
+    case DominantLane::kConfig:
+      return "config";
+    case DominantLane::kPowerSave:
+      return "power-save";
+  }
+  return "unknown";
+}
+
+const char* to_string(SourceCoordinatorState state) {
+  switch (state) {
+    case SourceCoordinatorState::kLocalCold:
+      return "LocalCold";
+    case SourceCoordinatorState::kLocalProbing:
+      return "LocalProbing";
+    case SourceCoordinatorState::kLocalConnected:
+      return "LocalConnected";
+    case SourceCoordinatorState::kLocalSleeping:
+      return "LocalSleeping";
+    case SourceCoordinatorState::kCloudFallback:
+      return "CloudFallback";
+    case SourceCoordinatorState::kHandoffToLocal:
+      return "HandoffToLocal";
+    case SourceCoordinatorState::kLocalPrimary:
+      return "LocalPrimary";
+    case SourceCoordinatorState::kCloudPrimary:
+      return "CloudPrimary";
+  }
+  return "Unknown";
+}
+
+DominantLane dominant_lane_for_ui(bool config_page_active, bool preview_page_active,
+                                  bool preview_page_visible, bool camera_page_active,
+                                  bool camera_page_visible, bool page_transition_active,
+                                  ScreenPowerMode screen_power_mode) {
+  if (screen_power_mode == ScreenPowerMode::kOff) {
+    return DominantLane::kPowerSave;
+  }
+  if (config_page_active) {
+    return DominantLane::kConfig;
+  }
+  if (camera_page_active) {
+    return DominantLane::kCamera;
+  }
+  if (preview_page_active || (page_transition_active && preview_page_visible)) {
+    return DominantLane::kPreview;
+  }
+  return DominantLane::kStatus;
+}
+
+bool local_connect_allowed_for_lane(DominantLane lane, SourceMode source_mode,
+                                    bool local_network_ready,
+                                    bool local_printer_enabled,
+                                    const PrinterSnapshot& local_snapshot,
+                                    bool local_mqtt_handoff_active) {
+  if (!local_network_ready || !local_printer_enabled || source_mode == SourceMode::kCloudOnly ||
+      local_mqtt_handoff_active) {
+    return false;
+  }
+  if (local_snapshot.local_connected) {
+    return true;
+  }
+
+  switch (lane) {
+    case DominantLane::kStatus:
+    case DominantLane::kCamera:
+      return true;
+    case DominantLane::kPreview:
+      return source_mode == SourceMode::kLocalOnly;
+    case DominantLane::kConfig:
+      return source_mode == SourceMode::kLocalOnly;
+    case DominantLane::kPowerSave:
+      return local_snapshot.print_active;
+  }
+  return false;
+}
+
+SourceCoordinatorState source_state_for(DominantLane lane, SourceMode source_mode,
+                                        bool local_printer_enabled,
+                                        bool local_network_ready,
+                                        bool local_connect_allowed,
+                                        bool local_mqtt_handoff_active,
+                                        bool hybrid_local_path_healthy,
+                                        bool hybrid_prefers_cloud,
+                                        bool cloud_network_ready,
+                                        const PrinterSnapshot& local_snapshot,
+                                        const BambuCloudSnapshot& cloud_snapshot) {
+  if (local_mqtt_handoff_active) {
+    return SourceCoordinatorState::kHandoffToLocal;
+  }
+  if (source_mode == SourceMode::kCloudOnly) {
+    return SourceCoordinatorState::kCloudPrimary;
+  }
+  if (!local_printer_enabled || !local_network_ready) {
+    if (source_mode == SourceMode::kHybrid && cloud_network_ready &&
+        (cloud_snapshot.connected || cloud_snapshot.session_connected)) {
+      return SourceCoordinatorState::kCloudFallback;
+    }
+    return SourceCoordinatorState::kLocalCold;
+  }
+  if (hybrid_local_path_healthy) {
+    return SourceCoordinatorState::kLocalPrimary;
+  }
+  if (local_snapshot.local_connected) {
+    return SourceCoordinatorState::kLocalConnected;
+  }
+  if (source_mode == SourceMode::kHybrid && cloud_network_ready &&
+      (cloud_snapshot.connected || cloud_snapshot.session_connected)) {
+    return hybrid_prefers_cloud ? SourceCoordinatorState::kCloudPrimary
+                                : SourceCoordinatorState::kCloudFallback;
+  }
+  if (local_printer_enabled && local_network_ready && local_connect_allowed) {
+    return SourceCoordinatorState::kLocalProbing;
+  }
+  if (local_printer_enabled && (lane == DominantLane::kPreview ||
+                                lane == DominantLane::kConfig ||
+                                lane == DominantLane::kPowerSave)) {
+    return SourceCoordinatorState::kLocalSleeping;
+  }
+  return SourceCoordinatorState::kCloudFallback;
+}
+
+uint32_t coordinator_signature(DominantLane lane, SourceCoordinatorState state,
+                               bool local_connect_allowed, bool camera_enabled,
+                               bool camera_stream_connected,
+                               bool cloud_network_ready, bool cloud_live_mqtt_enabled,
+                               bool pause_cloud_fetches, bool preview_fetch_enabled,
+                               bool deferred_local_probe, bool local_mqtt_budget_ok,
+                               bool camera_start_budget_ok, bool preview_fetch_budget_ok,
+                               const SourceConfidence& confidence) {
+  uint32_t sig = static_cast<uint32_t>(lane);
+  sig |= static_cast<uint32_t>(state) << 4;
+  sig |= (local_connect_allowed ? 1U : 0U) << 8;
+  sig |= (camera_enabled ? 1U : 0U) << 9;
+  sig |= (camera_stream_connected ? 1U : 0U) << 10;
+  sig |= (cloud_network_ready ? 1U : 0U) << 11;
+  sig |= (cloud_live_mqtt_enabled ? 1U : 0U) << 12;
+  sig |= (pause_cloud_fetches ? 1U : 0U) << 13;
+  sig |= (preview_fetch_enabled ? 1U : 0U) << 14;
+  sig |= (deferred_local_probe ? 1U : 0U) << 15;
+  sig |= (local_mqtt_budget_ok ? 1U : 0U) << 16;
+  sig |= (camera_start_budget_ok ? 1U : 0U) << 17;
+  sig |= (preview_fetch_budget_ok ? 1U : 0U) << 18;
+  sig |= ((static_cast<uint32_t>(confidence.local_score) / 25U) & 0x7U) << 19;
+  sig |= ((static_cast<uint32_t>(confidence.cloud_score) / 25U) & 0x7U) << 22;
+  return sig;
+}
+
+uint32_t age_ms_or_unknown(uint64_t now_ms, uint64_t update_ms) {
+  if (update_ms == 0 || update_ms > now_ms) {
+    return UINT32_MAX;
+  }
+  const uint64_t age = now_ms - update_ms;
+  return age > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(age);
+}
+
+uint8_t source_score(bool configured, bool network_ready, bool connected, uint32_t age_ms) {
+  if (!configured || !network_ready) {
+    return 0;
+  }
+  uint8_t score = connected ? 50 : 10;
+  if (age_ms <= kSourceFreshMs) {
+    score += 40;
+  } else if (age_ms <= kSourceRecentMs) {
+    score += 25;
+  } else if (age_ms <= kSourceOldMs) {
+    score += 10;
+  }
+  return score > 100 ? 100 : score;
+}
+
+int32_t age_seconds_for_log(uint32_t age_ms) {
+  return age_ms == UINT32_MAX ? -1 : static_cast<int32_t>(age_ms / 1000U);
+}
+
+SourceConfidence source_confidence(bool local_printer_enabled, bool local_network_ready,
+                                   const PrinterSnapshot& local_snapshot,
+                                   bool cloud_network_ready,
+                                   const BambuCloudSnapshot& cloud_snapshot,
+                                   uint64_t now_ms) {
+  SourceConfidence confidence;
+  confidence.local_age_ms = age_ms_or_unknown(now_ms, local_snapshot.local_last_update_ms);
+  const uint64_t cloud_update_ms = cloud_snapshot.live_data_last_update_ms != 0
+                                       ? cloud_snapshot.live_data_last_update_ms
+                                       : cloud_snapshot.last_update_ms;
+  confidence.cloud_age_ms = age_ms_or_unknown(now_ms, cloud_update_ms);
+  confidence.local_score =
+      source_score(local_printer_enabled, local_network_ready, local_snapshot.local_connected,
+                   confidence.local_age_ms);
+  confidence.cloud_score =
+      source_score(cloud_snapshot.configured, cloud_network_ready,
+                   cloud_snapshot.connected || cloud_snapshot.session_connected,
+                   confidence.cloud_age_ms);
+  return confidence;
 }
 
 bool hybrid_local_status_ready(const PrinterSnapshot& snapshot) {
@@ -165,12 +384,31 @@ Application::Application()
     : setup_portal_(config_store_, wifi_manager_, cloud_client_, printer_client_, camera_client_,
                     ui_, pmu_manager_) {
   cloud_client_.set_config_store(&config_store_);
+  cloud_client_.set_resource_arbiter(&resource_arbiter_);
+  printer_client_.set_resource_arbiter(&resource_arbiter_);
+  camera_client_.set_resource_arbiter(&resource_arbiter_);
+  ui_.set_resource_arbiter(&resource_arbiter_);
   // Route printer online/offline events from the Bambu Cloud MQTT feed to the
   // local PrinterClient so it can collapse its reconnect backoff the moment the
   // printer is known to be reachable again. Avoids blind TCP-probe cycles while
   // the printer is powered off or roaming on the LAN.
   cloud_client_.set_printer_presence_callback(
-      [this](bool online) { printer_client_.notify_cloud_presence(online); });
+      [this](bool online) {
+        if (!online) {
+          printer_client_.notify_cloud_presence(false);
+          return;
+        }
+        const auto lane =
+            static_cast<DominantLane>(dominant_lane_.load(std::memory_order_relaxed));
+        if (lane == DominantLane::kPreview || lane == DominantLane::kConfig ||
+            lane == DominantLane::kPowerSave) {
+          deferred_local_probe_ = true;
+          ESP_LOGI(kTag, "Cloud presence hint deferred while %s lane is dominant",
+                   to_string(lane));
+          return;
+        }
+        printer_client_.notify_cloud_presence(true);
+      });
   printer_client_.set_pre_local_mqtt_callback([this]() -> uint32_t {
     ESP_LOGI(kTag, "Local MQTT handoff: pausing cloud live MQTT and camera before TLS start");
     local_mqtt_handoff_until_tick_ = xTaskGetTickCount() + kLocalMqttHandoffCooldown;
@@ -264,22 +502,49 @@ void Application::run() {
     const bool wifi_connected = wifi_manager_.is_station_connected();
     const std::string wifi_ip = wifi_manager_.station_ip();
     const bool page_transition_active = ui_.is_page_transition_active();
+    const bool config_page_active = ui_.is_config_page_active();
     const bool preview_page_active = ui_.is_page2_active();
+    const bool preview_page_visible = ui_.is_page2_visible();
     const bool camera_page_active = ui_.is_camera_page_active();
+    const bool camera_page_visible = ui_.is_camera_page_visible();
+    const DominantLane dominant_lane = dominant_lane_for_ui(
+        config_page_active, preview_page_active, preview_page_visible, camera_page_active,
+        camera_page_visible, page_transition_active, ui_.screen_power_mode());
+    dominant_lane_.store(static_cast<uint8_t>(dominant_lane), std::memory_order_relaxed);
     source_mode_ = config_store_.load_source_mode();
     const bool local_network_ready = wifi_connected && source_mode_ != SourceMode::kCloudOnly;
     const bool local_mqtt_handoff_active =
         tick_deadline_active(local_mqtt_handoff_until_tick_.load(), now_tick);
-    printer_client_.set_network_ready(local_network_ready);
-    camera_client_.set_network_ready(local_network_ready);
     local_printer_enabled_ = printer_client_.is_configured();
     PrinterSnapshot local_snapshot = printer_client_.snapshot();
-    const bool camera_page_visible = ui_.is_camera_page_visible();
-    const bool camera_enabled =
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const size_t dma_largest = heap_caps_get_largest_free_block(MALLOC_CAP_DMA);
+    const bool local_mqtt_budget_ok =
+        internal_largest >= kLocalMqttStartMinInternalLargest &&
+        dma_largest >= kLocalMqttStartMinDmaLargest;
+    const bool camera_start_budget_ok =
+        internal_largest >= kCameraStartMinInternalLargest &&
+        dma_largest >= kCameraStartMinDmaLargest;
+    const bool preview_fetch_budget_ok =
+        internal_largest >= kPreviewFetchMinInternalLargest &&
+        dma_largest >= kPreviewFetchMinDmaLargest;
+    const bool local_connect_base_allowed = local_connect_allowed_for_lane(
+        dominant_lane, source_mode_, local_network_ready, local_printer_enabled_, local_snapshot,
+        local_mqtt_handoff_active);
+    const bool local_connect_allowed =
+        local_connect_base_allowed && (local_snapshot.local_connected || local_mqtt_budget_ok);
+    printer_client_.set_connect_allowed(local_connect_allowed);
+    printer_client_.set_network_ready(local_network_ready);
+    camera_client_.set_network_ready(local_network_ready);
+    const bool camera_stream_connected = camera_client_.is_stream_connected();
+    const bool camera_lane_allowed =
         source_mode_ != SourceMode::kCloudOnly && local_printer_enabled_ && wifi_connected &&
         local_snapshot.local_connected && !local_mqtt_handoff_active &&
-        (camera_page_active || (page_transition_active && camera_page_visible)) &&
+        !page_transition_active &&
+        dominant_lane == DominantLane::kCamera &&
         ui_.screen_power_mode() != ScreenPowerMode::kOff;
+    const bool camera_enabled =
+        camera_lane_allowed && (camera_start_budget_ok || camera_stream_connected);
     camera_client_.set_enabled(camera_enabled);
     if (ui_.consume_camera_refresh_request()) {
       camera_client_.request_refresh();
@@ -361,19 +626,74 @@ void Application::run() {
     const bool hybrid_local_path_healthy =
         source_mode_ == SourceMode::kHybrid && local_network_ready && local_printer_enabled_ &&
         local_snapshot.local_connected && hybrid_local_status_supported_now && !hybrid_prefers_cloud;
-    if (source_mode_ == SourceMode::kHybrid && hybrid_local_path_healthy && !preview_page_active) {
+    if (source_mode_ == SourceMode::kHybrid && hybrid_local_path_healthy &&
+        dominant_lane != DominantLane::kPreview && dominant_lane != DominantLane::kConfig) {
       cloud_network_ready = false;
     }
+    const bool may_release_deferred_probe =
+        deferred_local_probe_.load() && local_connect_allowed &&
+        dominant_lane != DominantLane::kPreview && dominant_lane != DominantLane::kConfig &&
+        dominant_lane != DominantLane::kPowerSave;
+    if (may_release_deferred_probe) {
+      deferred_local_probe_ = false;
+      ESP_LOGI(kTag, "Cloud presence hint released in %s lane", to_string(dominant_lane));
+      printer_client_.notify_cloud_presence(true);
+    }
+    const bool cloud_status_needed =
+        source_mode_ == SourceMode::kCloudOnly ||
+        (source_mode_ == SourceMode::kHybrid &&
+         (hybrid_prefers_cloud || !hybrid_local_path_healthy));
     const bool cloud_live_mqtt_enabled =
-        cloud_network_ready &&
-        !local_mqtt_handoff_active &&
-        (source_mode_ == SourceMode::kCloudOnly ||
-         (source_mode_ == SourceMode::kHybrid &&
-          (hybrid_prefers_cloud || !hybrid_local_path_healthy)));
+        cloud_network_ready && !local_mqtt_handoff_active && cloud_status_needed &&
+        dominant_lane != DominantLane::kCamera &&
+        dominant_lane != DominantLane::kConfig &&
+        dominant_lane != DominantLane::kPowerSave;
     const bool pause_cloud_fetches =
-        source_mode_ == SourceMode::kHybrid &&
-        (camera_page_active || page_transition_active || hybrid_camera_cooldown_active ||
-         local_mqtt_handoff_active || !cloud_network_ready);
+        !cloud_network_ready || local_mqtt_handoff_active ||
+        dominant_lane == DominantLane::kCamera ||
+        dominant_lane == DominantLane::kPowerSave ||
+        page_transition_active || hybrid_camera_cooldown_active ||
+        (source_mode_ == SourceMode::kHybrid && hybrid_local_path_healthy &&
+         dominant_lane != DominantLane::kPreview &&
+         dominant_lane != DominantLane::kConfig);
+    const bool preview_fetch_enabled =
+        source_mode_ != SourceMode::kLocalOnly &&
+        dominant_lane == DominantLane::kPreview &&
+        !local_mqtt_handoff_active && !page_transition_active && preview_fetch_budget_ok;
+    const SourceCoordinatorState source_state = source_state_for(
+        dominant_lane, source_mode_, local_printer_enabled_, local_network_ready,
+        local_connect_allowed, local_mqtt_handoff_active, hybrid_local_path_healthy,
+        hybrid_prefers_cloud, cloud_network_ready, local_snapshot, cloud_snapshot);
+    const SourceConfidence confidence =
+        source_confidence(local_printer_enabled_, local_network_ready, local_snapshot,
+                          cloud_network_ready, cloud_snapshot, now_ms);
+    const uint32_t signature = coordinator_signature(
+        dominant_lane, source_state, local_connect_allowed, camera_enabled,
+        camera_stream_connected, cloud_network_ready, cloud_live_mqtt_enabled,
+        pause_cloud_fetches, preview_fetch_enabled,
+        deferred_local_probe_.load(), local_mqtt_budget_ok, camera_start_budget_ok,
+        preview_fetch_budget_ok, confidence);
+    if (signature != last_coordinator_signature_) {
+      last_coordinator_signature_ = signature;
+      ESP_LOGI(kTag,
+               "Coordinator: lane=%s source=%s local_connect=%d camera=%d "
+               "camera_stream=%d cloud_net=%d cloud_live=%d cloud_fetch_paused=%d preview=%d "
+               "deferred_probe=%d local_budget=%d camera_budget=%d preview_budget=%d "
+               "local_score=%u cloud_score=%u local_age_s=%d cloud_age_s=%d "
+               "int_largest=%u dma_largest=%u",
+               to_string(dominant_lane), to_string(source_state), local_connect_allowed ? 1 : 0,
+               camera_enabled ? 1 : 0, camera_stream_connected ? 1 : 0,
+               cloud_network_ready ? 1 : 0, cloud_live_mqtt_enabled ? 1 : 0,
+               pause_cloud_fetches ? 1 : 0,
+               preview_fetch_enabled ? 1 : 0, deferred_local_probe_.load() ? 1 : 0,
+               local_mqtt_budget_ok ? 1 : 0, camera_start_budget_ok ? 1 : 0,
+               preview_fetch_budget_ok ? 1 : 0,
+               static_cast<unsigned>(confidence.local_score),
+               static_cast<unsigned>(confidence.cloud_score),
+               age_seconds_for_log(confidence.local_age_ms),
+               age_seconds_for_log(confidence.cloud_age_ms),
+               static_cast<unsigned>(internal_largest), static_cast<unsigned>(dma_largest));
+    }
     cloud_client_.set_network_ready(cloud_network_ready);
     cloud_client_.set_live_mqtt_enabled(cloud_live_mqtt_enabled);
     cloud_client_.set_fetch_paused(pause_cloud_fetches);
@@ -479,7 +799,7 @@ void Application::run() {
       snapshot.camera_blob = camera_snapshot.frame_blob;
       snapshot.camera_width = camera_snapshot.width;
       snapshot.camera_height = camera_snapshot.height;
-      if (!camera_page_active) {
+      if (dominant_lane != DominantLane::kCamera) {
         snapshot.camera_blob.reset();
         snapshot.camera_width = 0;
         snapshot.camera_height = 0;
@@ -509,23 +829,22 @@ void Application::run() {
     last_cloud_print_live_ = cloud_print_is_live(cloud_snapshot);
 
     const bool on_battery = power.available && power.battery_present && !power.usb_present;
-    const bool preview_pipeline_enabled =
-        source_mode_ == SourceMode::kCloudOnly || preview_page_active;
-    cloud_client_.set_preview_fetch_enabled(source_mode_ != SourceMode::kLocalOnly &&
-                                            preview_pipeline_enabled);
+    cloud_client_.set_preview_fetch_enabled(preview_fetch_enabled);
     bool keep_screen_awake;
     if (filament_wake_enabled_ && is_filament && !is_external_spool) {
       // AMS auto filament change: suppress wake, let display sleep
-      keep_screen_awake = camera_page_active || page_transition_active;
+      keep_screen_awake = dominant_lane == DominantLane::kCamera || page_transition_active;
     } else {
-      keep_screen_awake = snapshot.print_active || camera_page_active || page_transition_active;
+      keep_screen_awake =
+          snapshot.print_active || dominant_lane == DominantLane::kCamera || page_transition_active;
     }
     if (filament_wake_enabled_ && is_filament && is_external_spool) {
       ui_.request_wake_display();
     }
     ui_.update_power_save(on_battery, keep_screen_awake);
 
-    cloud_client_.set_low_power_mode(camera_page_active || page_transition_active ||
+    cloud_client_.set_low_power_mode(dominant_lane == DominantLane::kCamera ||
+                                     page_transition_active ||
                                      (on_battery && ui_.is_low_power_mode_active() &&
                                       !snapshot.print_active));
 

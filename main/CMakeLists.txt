@@ -17,6 +17,7 @@ idf_component_register(
         "src/printer_client.cpp"
         "src/printer_state.cpp"
         "src/debug_log_buffer.cpp"
+        "src/resource_arbiter.cpp"
         "src/setup_portal.cpp"
         "src/status_resolver.cpp"
         "src/ui.cpp"

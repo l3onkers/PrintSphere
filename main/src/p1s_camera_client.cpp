@@ -25,6 +25,8 @@ constexpr uint16_t kCameraPort = 6000;
 constexpr size_t kFrameHeaderBytes = 16;
 constexpr size_t kMaxFrameBytes = 256U * 1024U;
 constexpr size_t kImagePersistentReserveBytes = 20U * 1024U;
+constexpr size_t kJpegRxSlotReserveBytes = 128U * 1024U;
+constexpr size_t kTlsReadChunkBytes = 4096U;
 constexpr int64_t kAutoRefreshIntervalUs = 2000000;
 constexpr int64_t kTlsReadDeadlineUs = 4000000;
 constexpr int64_t kTlsWriteDeadlineUs = 2000000;
@@ -261,6 +263,42 @@ void P1sCameraClient::set_frame_snapshot(bool configured, bool enabled, bool con
   snapshot_.height = height;
 }
 
+std::shared_ptr<std::vector<uint8_t>> P1sCameraClient::prepare_jpeg_rx_slot(size_t frame_size) {
+  if (!media_cache_.jpeg_rx) {
+    media_cache_.jpeg_rx = std::make_shared<std::vector<uint8_t>>();
+  }
+  const size_t old_capacity = media_cache_.jpeg_rx->capacity();
+  media_cache_.jpeg_rx->reserve(std::max(frame_size, kJpegRxSlotReserveBytes));
+  media_cache_.jpeg_rx->resize(frame_size);
+  if (media_cache_.jpeg_rx->capacity() != old_capacity) {
+    log_blob_diag("camera media cache jpeg rx slot", media_cache_.jpeg_rx);
+  }
+  return media_cache_.jpeg_rx;
+}
+
+std::shared_ptr<std::vector<uint8_t>> P1sCameraClient::prepare_rgb565_back_slot(size_t frame_size) {
+  auto& slot = media_cache_.rgb565_slots[media_cache_.rgb565_write_slot];
+  if (!slot) {
+    slot = std::make_shared<std::vector<uint8_t>>();
+  }
+  const size_t old_capacity = slot->capacity();
+  slot->reserve(frame_size);
+  slot->resize(frame_size);
+  if (slot->capacity() != old_capacity) {
+    log_blob_diag("camera media cache rgb565 back slot", slot);
+  }
+  return slot;
+}
+
+void P1sCameraClient::commit_rgb565_back_slot() {
+  media_cache_.rgb565_write_slot =
+      static_cast<uint8_t>((media_cache_.rgb565_write_slot + 1U) % media_cache_.rgb565_slots.size());
+}
+
+void P1sCameraClient::reset_media_cache() {
+  media_cache_ = {};
+}
+
 bool P1sCameraClient::has_cached_frame() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return has_frame_data(snapshot_.frame_blob);
@@ -274,11 +312,15 @@ bool P1sCameraClient::read_exact(esp_tls_t* tls, void* buffer, size_t length) {
     if (esp_timer_get_time() >= deadline_us) {
       return false;
     }
-    const ssize_t read = esp_tls_conn_read(tls, out + offset, length - offset);
+    const size_t chunk = std::min(kTlsReadChunkBytes, length - offset);
+    const ssize_t read = esp_tls_conn_read(tls, out + offset, chunk);
     if (read <= 0) {
       return false;
     }
     offset += static_cast<size_t>(read);
+    if (offset < length) {
+      taskYIELD();
+    }
   }
   return true;
 }
@@ -302,9 +344,20 @@ bool P1sCameraClient::write_all(esp_tls_t* tls, const void* buffer, size_t lengt
 
 bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
   if (tls_ != nullptr) {
+    stream_connected_.store(true);
     return true;
   }
 
+  ResourceArbiter::Lease camera_tls_lease;
+  if (resource_arbiter_ != nullptr) {
+    camera_tls_lease =
+        resource_arbiter_->try_acquire(ResourceKind::kCameraTls, "camera", "connect");
+    if (!camera_tls_lease) {
+      return false;
+    }
+  }
+
+  stream_connected_.store(false);
   log_heap_diag("camera before tls init");
 
   esp_tls_cfg_t tls_cfg = {};
@@ -340,6 +393,7 @@ bool P1sCameraClient::ensure_connected(const PrinterConnection& connection) {
 
   ESP_LOGI(kTag, "Connected to local chamber camera on %s:%u", connection.host.c_str(),
            static_cast<unsigned>(kCameraPort));
+  stream_connected_.store(true);
   log_heap_diag("camera after tls auth");
   return true;
 }
@@ -349,11 +403,174 @@ void P1sCameraClient::disconnect() {
     esp_tls_conn_destroy(tls_);
     tls_ = nullptr;
   }
+  stream_connected_.store(false);
 }
 
 bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
                                           std::shared_ptr<std::vector<uint8_t>>* out_blob,
                                           uint16_t* out_width, uint16_t* out_height) {
+  ResourceArbiter::Lease decode_lease;
+  if (resource_arbiter_ != nullptr) {
+    decode_lease =
+        resource_arbiter_->try_acquire(ResourceKind::kJpegDecode, "camera", "jpeg-decode");
+    if (!decode_lease) {
+      return false;
+    }
+  }
+
+  const DecodeResult block_result =
+      decode_frame_rgb565_blocked(jpeg_blob, out_blob, out_width, out_height);
+  if (block_result == DecodeResult::kOk) {
+    return true;
+  }
+  if (block_result == DecodeResult::kSkipFrame) {
+    return false;
+  }
+  ESP_LOGW(kTag, "Camera block decode failed, falling back to scaled full-frame decode");
+  return decode_frame_rgb565_scaled(jpeg_blob, out_blob, out_width, out_height);
+}
+
+P1sCameraClient::DecodeResult P1sCameraClient::decode_frame_rgb565_blocked(
+    const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
+    std::shared_ptr<std::vector<uint8_t>>* out_blob, uint16_t* out_width, uint16_t* out_height) {
+  if (!jpeg_blob || jpeg_blob->empty() || out_blob == nullptr || out_width == nullptr ||
+      out_height == nullptr) {
+    return DecodeResult::kTryFallback;
+  }
+
+  DisplayDecodeGuard display_guard(100);
+  if (!display_guard.locked()) {
+    ESP_LOGW(kTag, "Camera block decode skipped: LVGL lock busy");
+    return DecodeResult::kSkipFrame;
+  }
+
+  jpeg_dec_config_t config = DEFAULT_JPEG_DEC_CONFIG();
+  config.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+  config.block_enable = true;
+
+  jpeg_dec_handle_t decoder = nullptr;
+  jpeg_dec_io_t io = {};
+  jpeg_dec_header_info_t header = {};
+
+  if (jpeg_dec_open(&config, &decoder) != JPEG_ERR_OK || decoder == nullptr) {
+    ESP_LOGW(kTag, "JPEG block decoder open failed");
+    return DecodeResult::kTryFallback;
+  }
+
+  io.inbuf = const_cast<uint8_t*>(jpeg_blob->data());
+  io.inbuf_len = static_cast<int>(jpeg_blob->size());
+
+  DecodeResult result = DecodeResult::kTryFallback;
+  void* block_out = nullptr;
+  do {
+    if (jpeg_dec_parse_header(decoder, &io, &header) != JPEG_ERR_OK) {
+      ESP_LOGW(kTag, "JPEG block header parse failed");
+      break;
+    }
+    if (header.width == 0U || header.height == 0U ||
+        (header.width % 8U) != 0U || (header.height % 8U) != 0U) {
+      ESP_LOGW(kTag, "JPEG block decode unsupported geometry: %ux%u",
+               static_cast<unsigned>(header.width), static_cast<unsigned>(header.height));
+      break;
+    }
+
+    int block_len = 0;
+    if (jpeg_dec_get_outbuf_len(decoder, &block_len) != JPEG_ERR_OK || block_len <= 0) {
+      ESP_LOGW(kTag, "JPEG block output length query failed");
+      break;
+    }
+
+    int process_count = 0;
+    if (jpeg_dec_get_process_count(decoder, &process_count) != JPEG_ERR_OK || process_count <= 0) {
+      ESP_LOGW(kTag, "JPEG block process count query failed");
+      break;
+    }
+
+    block_out = jpeg_calloc_align(static_cast<size_t>(block_len), 16);
+    if (block_out == nullptr) {
+      ESP_LOGW(kTag, "JPEG block buffer allocation failed");
+      log_heap_diag("camera jpeg block allocation failed");
+      break;
+    }
+    log_ptr_diag("camera jpeg block decode buffer", block_out, static_cast<size_t>(block_len));
+
+    auto decoded = prepare_rgb565_back_slot(static_cast<size_t>(kTargetWidth) * kTargetHeight * 2U);
+    std::fill(decoded->begin(), decoded->end(), 0);
+
+    io.outbuf = static_cast<uint8_t*>(block_out);
+    const size_t source_row_bytes = static_cast<size_t>(header.width) * 2U;
+    uint16_t source_y_base = 0;
+    bool blocks_ok = true;
+    for (int block_index = 0; block_index < process_count; ++block_index) {
+      if (jpeg_dec_process(decoder, &io) != JPEG_ERR_OK) {
+        ESP_LOGW(kTag, "JPEG block decode failed at block %d", block_index);
+        blocks_ok = false;
+        break;
+      }
+
+      const size_t out_size = io.out_size > 0 ? static_cast<size_t>(io.out_size) : 0U;
+      if (source_row_bytes == 0U || out_size == 0U || (out_size % source_row_bytes) != 0U) {
+        ESP_LOGW(kTag, "JPEG block output size invalid: %u",
+                 static_cast<unsigned>(out_size));
+        blocks_ok = false;
+        break;
+      }
+
+      const uint16_t source_rows =
+          static_cast<uint16_t>(out_size / source_row_bytes);
+      const auto* block = static_cast<const uint8_t*>(block_out);
+      for (uint16_t target_y = 0; target_y < kTargetHeight; ++target_y) {
+        const uint32_t source_y =
+            (static_cast<uint32_t>(target_y) * header.height + kTargetHeight / 2U) /
+            kTargetHeight;
+        if (source_y < source_y_base || source_y >= source_y_base + source_rows) {
+          continue;
+        }
+        const size_t block_row =
+            static_cast<size_t>(source_y - source_y_base) * source_row_bytes;
+        auto* target = decoded->data() + static_cast<size_t>(target_y) * kTargetWidth * 2U;
+        for (uint16_t target_x = 0; target_x < kTargetWidth; ++target_x) {
+          uint32_t source_x =
+              (static_cast<uint32_t>(target_x) * header.width + kTargetWidth / 2U) /
+              kTargetWidth;
+          if (source_x >= header.width) {
+            source_x = header.width - 1U;
+          }
+          const size_t source_offset = block_row + static_cast<size_t>(source_x) * 2U;
+          target[static_cast<size_t>(target_x) * 2U] = block[source_offset];
+          target[static_cast<size_t>(target_x) * 2U + 1U] = block[source_offset + 1U];
+        }
+      }
+      source_y_base = static_cast<uint16_t>(source_y_base + source_rows);
+      taskYIELD();
+    }
+
+    if (!blocks_ok || source_y_base < header.height) {
+      ESP_LOGW(kTag, "JPEG block decode incomplete: %u/%u rows",
+               static_cast<unsigned>(source_y_base), static_cast<unsigned>(header.height));
+      break;
+    }
+
+    log_blob_diag("camera rgb565 back buffer", decoded);
+    *out_blob = std::move(decoded);
+    *out_width = kTargetWidth;
+    *out_height = kTargetHeight;
+    commit_rgb565_back_slot();
+    result = DecodeResult::kOk;
+  } while (false);
+
+  if (block_out != nullptr) {
+    jpeg_free_align(block_out);
+  }
+  if (decoder != nullptr) {
+    jpeg_dec_close(decoder);
+  }
+  return result;
+}
+
+bool P1sCameraClient::decode_frame_rgb565_scaled(
+    const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
+    std::shared_ptr<std::vector<uint8_t>>* out_blob, uint16_t* out_width, uint16_t* out_height) {
   if (!jpeg_blob || jpeg_blob->empty() || out_blob == nullptr || out_width == nullptr ||
       out_height == nullptr) {
     return false;
@@ -410,14 +627,13 @@ bool P1sCameraClient::decode_frame_rgb565(const std::shared_ptr<std::vector<uint
       break;
     }
 
-    auto decoded = std::make_shared<std::vector<uint8_t>>();
-    decoded->reserve(std::max(static_cast<size_t>(out_len), kImagePersistentReserveBytes));
-    decoded->resize(static_cast<size_t>(out_len));
+    auto decoded = prepare_rgb565_back_slot(static_cast<size_t>(out_len));
     std::memcpy(decoded->data(), aligned_out, static_cast<size_t>(out_len));
-    log_blob_diag("camera rgb565 decoded buffer", decoded);
+    log_blob_diag("camera rgb565 back buffer (scaled)", decoded);
     *out_blob = std::move(decoded);
     *out_width = config.scale.width > 0U ? config.scale.width : header.width;
     *out_height = config.scale.height > 0U ? config.scale.height : header.height;
+    commit_rgb565_back_slot();
     ok = true;
   } while (false);
 
@@ -469,15 +685,18 @@ bool P1sCameraClient::fetch_frame_once(const PrinterConnection& connection) {
       return false;
     }
 
-    auto jpeg_frame = std::make_shared<std::vector<uint8_t>>();
-    jpeg_frame->reserve(std::max(static_cast<size_t>(frame_size), kImagePersistentReserveBytes));
-    jpeg_frame->resize(frame_size);
+    auto jpeg_frame = prepare_jpeg_rx_slot(frame_size);
     if (!read_exact(tls_, jpeg_frame->data(), jpeg_frame->size())) {
       ESP_LOGW(kTag, "Camera frame body read failed");
       disconnect();
       return false;
     }
     log_blob_diag("camera jpeg frame buffer", jpeg_frame);
+
+    if (!enabled_.load()) {
+      ESP_LOGD(kTag, "Camera disabled before decode, dropping received frame");
+      return false;
+    }
 
     if ((*jpeg_frame)[0] != 0xFFU || (*jpeg_frame)[1] != 0xD8U ||
         (*jpeg_frame)[jpeg_frame->size() - 2] != 0xFFU ||
@@ -511,6 +730,7 @@ void P1sCameraClient::task_loop() {
   while (true) {
     if (reconfigure_requested_.exchange(false)) {
       disconnect();
+      reset_media_cache();
       refresh_requested_.store(false);
       idle_notified_ = false;
       last_fetch_us = 0;
@@ -581,11 +801,16 @@ void P1sCameraClient::task_loop() {
       continue;
     }
 
-    set_status_snapshot(true, true, false, "Loading camera image");
+    set_status_snapshot(true, true, stream_connected_.load(), "Loading camera image");
 
+    const int64_t fetch_start_us = esp_timer_get_time();
     const bool ok = fetch_frame_once(connection);
-    last_fetch_us = esp_timer_get_time();
+    last_fetch_us = ok ? fetch_start_us : esp_timer_get_time();
     if (!ok) {
+      if (!enabled_.load()) {
+        consecutive_connect_failures_ = 0;
+        continue;
+      }
       ++consecutive_connect_failures_;
       const uint32_t backoff_ms =
           consecutive_connect_failures_ <= 1 ? 2000U :

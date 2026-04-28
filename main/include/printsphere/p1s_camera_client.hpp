@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -13,6 +15,7 @@
 #include "freertos/task.h"
 #include "printsphere/config_store.hpp"
 #include "printsphere/printer_state.hpp"
+#include "printsphere/resource_arbiter.hpp"
 
 namespace printsphere {
 
@@ -31,9 +34,11 @@ class P1sCameraClient {
   P1sCameraClient() = default;
 
   void configure(PrinterConnection connection);
+  void set_resource_arbiter(ResourceArbiter* arbiter) { resource_arbiter_ = arbiter; }
   bool is_configured() const;
   void set_network_ready(bool ready) { network_ready_.store(ready); }
   void set_enabled(bool enabled) { enabled_.store(enabled); }
+  bool is_stream_connected() const { return stream_connected_.load(); }
   void request_refresh() { refresh_requested_.store(true); }
   void observe_printer_snapshot(const PrinterSnapshot& snapshot);
   esp_err_t start();
@@ -52,18 +57,40 @@ class P1sCameraClient {
   void set_frame_snapshot(bool configured, bool enabled, bool connected, const char* detail,
                           std::shared_ptr<std::vector<uint8_t>> frame_blob, uint16_t width,
                           uint16_t height);
+  struct CameraMediaCache {
+    std::shared_ptr<std::vector<uint8_t>> jpeg_rx;
+    std::array<std::shared_ptr<std::vector<uint8_t>>, 2> rgb565_slots{};
+    uint8_t rgb565_write_slot = 0;
+  };
+  enum class DecodeResult {
+    kOk,
+    kTryFallback,
+    kSkipFrame,
+  };
+  std::shared_ptr<std::vector<uint8_t>> prepare_jpeg_rx_slot(size_t frame_size);
+  std::shared_ptr<std::vector<uint8_t>> prepare_rgb565_back_slot(size_t frame_size);
+  void commit_rgb565_back_slot();
+  void reset_media_cache();
   PrinterModel observed_model() const;
   std::string observed_rtsp_url() const;
   bool observed_signature_required() const;
   bool has_cached_frame() const;
   static bool read_exact(esp_tls_t* tls, void* buffer, size_t length);
   static bool write_all(esp_tls_t* tls, const void* buffer, size_t length);
-  static bool decode_frame_rgb565(const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
-                                  std::shared_ptr<std::vector<uint8_t>>* out_blob, uint16_t* out_width,
-                                  uint16_t* out_height);
+  bool decode_frame_rgb565(const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
+                           std::shared_ptr<std::vector<uint8_t>>* out_blob, uint16_t* out_width,
+                           uint16_t* out_height);
+  DecodeResult decode_frame_rgb565_blocked(
+      const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
+      std::shared_ptr<std::vector<uint8_t>>* out_blob, uint16_t* out_width,
+      uint16_t* out_height);
+  bool decode_frame_rgb565_scaled(const std::shared_ptr<std::vector<uint8_t>>& jpeg_blob,
+                                  std::shared_ptr<std::vector<uint8_t>>* out_blob,
+                                  uint16_t* out_width, uint16_t* out_height);
 
   mutable std::mutex mutex_{};
   P1sCameraSnapshot snapshot_{};
+  CameraMediaCache media_cache_{};
   mutable std::mutex config_mutex_{};
   PrinterConnection desired_connection_{};
   mutable std::mutex observed_mutex_{};
@@ -72,8 +99,10 @@ class P1sCameraClient {
   bool observed_signature_required_ = false;
   TaskHandle_t task_handle_ = nullptr;
   esp_tls_t* tls_ = nullptr;
+  ResourceArbiter* resource_arbiter_ = nullptr;
   std::atomic<bool> network_ready_{false};
   std::atomic<bool> enabled_{false};
+  std::atomic<bool> stream_connected_{false};
   std::atomic<bool> refresh_requested_{false};
   std::atomic<bool> reconfigure_requested_{false};
   bool idle_notified_ = false;

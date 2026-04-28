@@ -1353,6 +1353,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
 
   switch (static_cast<esp_mqtt_event_id_t>(event->event_id)) {
     case MQTT_EVENT_CONNECTED: {
+      local_mqtt_lease_.reset();
       cancel_client_rebuild();
       consecutive_probe_failures_ = 0;
       consecutive_mqtt_errors_ = 0;
@@ -1438,6 +1439,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     }
 
     case MQTT_EVENT_DISCONNECTED: {
+      local_mqtt_lease_.reset();
       mqtt_connected_ = false;
       subscription_acknowledged_ = false;
       initial_sync_sent_ = false;
@@ -1505,6 +1507,7 @@ void PrinterClient::handle_mqtt_event(esp_mqtt_event_handle_t event) {
     }
 
     case MQTT_EVENT_ERROR: {
+      local_mqtt_lease_.reset();
       mqtt_connected_ = false;
       subscription_acknowledged_ = false;
       initial_sync_sent_ = false;
@@ -2233,6 +2236,7 @@ void PrinterClient::handle_report_payload(const char* payload, size_t length) {
 }
 
 void PrinterClient::stop_client() {
+  local_mqtt_lease_.reset();
   mqtt_connected_ = false;
   session_ever_established_ = false;
   received_payload_ = false;
@@ -2411,6 +2415,17 @@ void PrinterClient::set_network_ready(bool ready) {
   }
 }
 
+void PrinterClient::set_connect_allowed(bool allowed) {
+  const bool previous = connect_allowed_.exchange(allowed);
+  if (allowed && !previous) {
+    ESP_LOGI(kTag, "Resource arbiter: local MQTT connect/rebuild resumed");
+    wake_task();
+  } else if (!allowed && previous) {
+    ESP_LOGI(kTag, "Resource arbiter: local MQTT connect/rebuild paused");
+    wake_task();
+  }
+}
+
 void PrinterClient::task_loop() {
   while (true) {
     if (runtime_dirty_.exchange(false)) {
@@ -2480,6 +2495,31 @@ void PrinterClient::task_loop() {
       store_runtime_state(std::move(waiting), false);
       publish_runtime_snapshot();
       vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+
+    if (!connect_allowed_.load() && !mqtt_connected_.load()) {
+      stop_client();
+      {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        active_connection_ = connection;
+      }
+
+      LocalPrinterRuntimeState paused = runtime_state_copy();
+      paused.connection = PrinterConnectionState::kReadyForLanConnect;
+      paused.lifecycle = PrintLifecycleState::kUnknown;
+      copy_text(&paused.raw_status, "");
+      copy_text(&paused.raw_stage, "");
+      copy_text(&paused.stage, "local-paused");
+      copy_text(&paused.detail, "Local MQTT waiting for resource lane");
+      paused.has_error = false;
+      paused.non_error_stop = false;
+      paused.show_stop_banner = false;
+      copy_text(&paused.resolved_serial, connection.serial);
+      update_local_runtime_metadata(&paused, true, false);
+      store_runtime_state(std::move(paused), false);
+      publish_runtime_snapshot();
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
       continue;
     }
 
@@ -2640,6 +2680,16 @@ void PrinterClient::task_loop() {
         vTaskDelay(pdMS_TO_TICKS(handoff_delay_ms));
       }
 
+      if (resource_arbiter_ != nullptr) {
+        local_mqtt_lease_ =
+            resource_arbiter_->try_acquire(ResourceKind::kTlsLocalMqtt, "local-mqtt", "connect");
+        if (!local_mqtt_lease_) {
+          schedule_client_rebuild("resource lane busy", 750);
+          vTaskDelay(pdMS_TO_TICKS(250));
+          continue;
+        }
+      }
+
       esp_mqtt_client_config_t mqtt_cfg = {};
       mqtt_cfg.broker.address.transport = MQTT_TRANSPORT_OVER_SSL;
       const std::string& local_ca_bundle = local_bambu_ca_bundle();
@@ -2679,6 +2729,7 @@ void PrinterClient::task_loop() {
       log_heap_status("Before MQTT client init");
       client_ = esp_mqtt_client_init(&mqtt_cfg);
       if (client_ == nullptr) {
+        local_mqtt_lease_.reset();
         LocalPrinterRuntimeState failed = runtime_state_copy();
         failed.connection = PrinterConnectionState::kError;
         failed.lifecycle = PrintLifecycleState::kError;
@@ -2700,6 +2751,7 @@ void PrinterClient::task_loop() {
       log_heap_status("Before MQTT client start (TLS handshake)");
       esp_mqtt_client_register_event(client_, MQTT_EVENT_ANY, &PrinterClient::mqtt_event_handler, this);
       if (esp_mqtt_client_start(client_) != ESP_OK) {
+        local_mqtt_lease_.reset();
         LocalPrinterRuntimeState failed = runtime_state_copy();
         failed.connection = PrinterConnectionState::kError;
         failed.lifecycle = PrintLifecycleState::kError;

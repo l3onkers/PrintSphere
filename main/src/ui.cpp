@@ -369,11 +369,21 @@ std::string optional_temperature_text(const char* label, float temperature_c, bo
   return buffer;
 }
 
-bool decode_preview_png(const std::shared_ptr<std::vector<uint8_t>>& encoded_blob,
+bool decode_preview_png(ResourceArbiter* resource_arbiter,
+                        const std::shared_ptr<std::vector<uint8_t>>& encoded_blob,
                         std::shared_ptr<std::vector<uint8_t>>* decoded_blob,
                         lv_image_dsc_t* image_dsc) {
   if (!encoded_blob || encoded_blob->empty() || decoded_blob == nullptr || image_dsc == nullptr) {
     return false;
+  }
+
+  ResourceArbiter::Lease decode_lease;
+  if (resource_arbiter != nullptr) {
+    decode_lease =
+        resource_arbiter->try_acquire(ResourceKind::kPngDecode, "ui", "preview-png");
+    if (!decode_lease) {
+      return false;
+    }
   }
 
   png_image image;
@@ -1468,7 +1478,8 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
       !snapshot.preview_blob->empty() &&
       (!last_preview_raw_ || last_preview_raw_->empty());
   if (preview_page_active && (preview_blob_changed || needs_first_decode)) {
-    decode_preview_png(snapshot.preview_blob, &pre_decoded_raw, &pre_decoded_dsc);
+    decode_preview_png(resource_arbiter_, snapshot.preview_blob, &pre_decoded_raw,
+                       &pre_decoded_dsc);
   }
 
   LvglLockGuard lock(500, "apply_snapshot");

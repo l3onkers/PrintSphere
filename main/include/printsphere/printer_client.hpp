@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 #include "printsphere/config_store.hpp"
 #include "printsphere/printer_state.hpp"
+#include "printsphere/resource_arbiter.hpp"
 
 struct cJSON;
 
@@ -22,6 +23,7 @@ class PrinterClient {
   PrinterClient() = default;
 
   void configure(PrinterConnection connection);
+  void set_resource_arbiter(ResourceArbiter* arbiter) { resource_arbiter_ = arbiter; }
   bool is_configured() const;
   // Notify the client about Wi-Fi station link state. A transition from
   // not-ready → ready also acts as an implicit presence hint (see
@@ -38,6 +40,9 @@ class PrinterClient {
   // Called immediately before the local MQTT client allocates/starts its TLS stack.
   // Return a short delay in ms when other network clients need time to unwind.
   void set_pre_local_mqtt_callback(std::function<uint32_t()> cb);
+  // Resource-arbiter gate: when false, keep an already-connected local MQTT
+  // session alive, but do not start/rebuild a new heavy TLS/MQTT connection.
+  void set_connect_allowed(bool allowed);
   bool set_chamber_light(bool on);
   esp_err_t start();
   PrinterSnapshot snapshot() const { return state_.snapshot(); }
@@ -129,6 +134,8 @@ class PrinterClient {
   mutable std::mutex pre_local_mqtt_mutex_{};
   std::function<uint32_t()> pre_local_mqtt_callback_{};
   PrinterStateStore state_{};
+  ResourceArbiter* resource_arbiter_ = nullptr;
+  ResourceArbiter::Lease local_mqtt_lease_{};
   mutable std::mutex runtime_mutex_{};
   LocalPrinterRuntimeState runtime_state_{};
   TaskHandle_t task_handle_ = nullptr;
@@ -154,6 +161,7 @@ class PrinterClient {
   std::atomic<bool> delayed_pushall_sent_{false};
   std::atomic<bool> first_payload_observed_{false};
   std::atomic<bool> network_ready_{false};
+  std::atomic<bool> connect_allowed_{true};
   std::atomic<bool> reconfigure_requested_{false};
   std::atomic<bool> chamber_light_command_pending_{false};
   std::atomic<bool> chamber_light_command_on_{false};

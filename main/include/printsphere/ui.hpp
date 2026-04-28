@@ -11,6 +11,7 @@
 #include "esp_err.h"
 #include "printsphere/config_store.hpp"
 #include "printsphere/printer_state.hpp"
+#include "printsphere/resource_arbiter.hpp"
 
 namespace printsphere {
 
@@ -23,6 +24,7 @@ enum class ScreenPowerMode : uint8_t {
 class Ui {
  public:
   void set_display_rotation(DisplayRotation rotation);
+  void set_resource_arbiter(ResourceArbiter* arbiter) { resource_arbiter_ = arbiter; }
   esp_err_t initialize();
   void set_arc_color_scheme(const ArcColorScheme& colors);
   void apply_snapshot(const PrinterSnapshot& snapshot);
@@ -32,6 +34,7 @@ class Ui {
   ScreenPowerMode screen_power_mode() const { return screen_power_mode_; }
   bool is_config_page_active() const { return !scrolling_ && active_page_ == 0; }
   bool is_page2_active() const { return !scrolling_ && active_page_ == 3; }
+  bool is_page2_visible() const { return active_page_ == 3; }
   bool is_camera_page_active() const { return !scrolling_ && active_page_ == 4; }
   bool is_camera_page_visible() const { return active_page_ == 4; }
   bool is_page_transition_active() const { return scrolling_; }
@@ -91,6 +94,7 @@ class Ui {
   static void logo_event_cb(lv_event_t* event);
 
   bool initialized_ = false;
+  ResourceArbiter* resource_arbiter_ = nullptr;
   lv_display_t* display_ = nullptr;
   lv_obj_t* screen_ = nullptr;
   lv_obj_t* pager_ = nullptr;
