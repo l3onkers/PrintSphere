@@ -290,8 +290,11 @@ void enable_touch_bubble(lv_obj_t* obj) {
   lv_obj_add_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
 }
 
-// Draw callback for the green triangle active-slot indicator.
+// Draw callback for the green/red triangle slot indicator.
 // The triangle is an upward-pointing isosceles triangle centered in the object.
+// The bg_color style controls the triangle color; the bg_opa style controls
+// the triangle opacity (used for the pulse animation when an HMS error is
+// flagged on the slot).
 void ams_arrow_draw_cb(lv_event_t* e) {
   auto* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
   lv_layer_t* layer = lv_event_get_layer(e);
@@ -312,6 +315,58 @@ void ams_arrow_draw_cb(lv_event_t* e) {
   dsc.color = color;
   dsc.opa = LV_OPA_COVER;
   lv_draw_triangle(layer, &dsc);
+}
+
+// Draw callback that overlays a rhombus (diamond stripe) pattern on the
+// AMS pill rect when an HMS/Error code is mapped to that slot. Activated by
+// setting the user-data flag pointer to a `bool*` that evaluates to true.
+void ams_pill_error_overlay_cb(lv_event_t* e) {
+  auto* obj = static_cast<lv_obj_t*>(lv_event_get_target(e));
+  lv_layer_t* layer = lv_event_get_layer(e);
+  if (obj == nullptr || layer == nullptr) return;
+  const bool* flag = static_cast<const bool*>(lv_event_get_user_data(e));
+  if (flag == nullptr || !*flag) return;
+
+  lv_area_t coords;
+  lv_obj_get_coords(obj, &coords);
+  const int32_t x1 = coords.x1;
+  const int32_t y1 = coords.y1;
+  const int32_t x2 = coords.x2;
+  const int32_t y2 = coords.y2;
+  const int32_t w = x2 - x1;
+  const int32_t h = y2 - y1;
+
+  // Draw a diagonal stripe pattern (two crossing line sets = rhombus grid).
+  lv_draw_line_dsc_t line;
+  lv_draw_line_dsc_init(&line);
+  line.color = lv_color_hex(0xFFFFFF);
+  line.opa = LV_OPA_50;
+  line.width = 2;
+  const int32_t spacing = 12;
+  // Forward diagonals
+  for (int32_t k = -h; k < w; k += spacing) {
+    int32_t a_x = x1 + k;
+    int32_t a_y = y1;
+    int32_t b_x = x1 + k + h;
+    int32_t b_y = y2;
+    if (a_x < x1) { a_y += (x1 - a_x); a_x = x1; }
+    if (b_x > x2) { b_y -= (b_x - x2); b_x = x2; }
+    line.p1 = {a_x, a_y};
+    line.p2 = {b_x, b_y};
+    lv_draw_line(layer, &line);
+  }
+  // Backward diagonals
+  for (int32_t k = 0; k < w + h; k += spacing) {
+    int32_t a_x = x1 + k;
+    int32_t a_y = y1;
+    int32_t b_x = x1 + k - h;
+    int32_t b_y = y2;
+    if (a_x > x2) { a_y += (a_x - x2); a_x = x2; }
+    if (b_x < x1) { b_y -= (x1 - b_x); b_x = x1; }
+    line.p1 = {a_x, a_y};
+    line.p2 = {b_x, b_y};
+    lv_draw_line(layer, &line);
+  }
 }
 
 int display_rotation_visual_offset_x(DisplayRotation rotation) {
@@ -478,17 +533,18 @@ uint32_t ams_ui_signature(const PrinterSnapshot& snapshot) {
     return hash;
   }
 
-  const AmsUnitInfo& unit = snapshot.ams->units[0];
-  hash = hash_mix(hash, unit.humidity_pct < 0 ? 0xFFFFFFFFU : static_cast<uint32_t>(unit.humidity_pct));
-  hash = hash_mix(hash, static_cast<uint32_t>(std::lround(unit.temperature_c * 10.0f)));
-
-  for (int i = 0; i < kMaxAmsTrays; ++i) {
-    const AmsTrayInfo& tray = unit.trays[i];
-    hash = hash_mix(hash, tray.present ? 1U : 0U);
-    hash = hash_mix(hash, tray.active ? 1U : 0U);
-    hash = hash_mix(hash, tray.color_rgba);
-    hash = hash_mix(hash, tray.remain_pct < 0 ? 0xFFFFFFFFU : static_cast<uint32_t>(tray.remain_pct));
-    hash = hash_string(hash, tray.material_type);
+  for (uint8_t u = 0; u < snapshot.ams->count && u < kMaxAmsUnits; ++u) {
+    const AmsUnitInfo& unit = snapshot.ams->units[u];
+    hash = hash_mix(hash, unit.humidity_pct < 0 ? 0xFFFFFFFFU : static_cast<uint32_t>(unit.humidity_pct));
+    hash = hash_mix(hash, static_cast<uint32_t>(std::lround(unit.temperature_c * 10.0f)));
+    for (int i = 0; i < kMaxAmsTrays; ++i) {
+      const AmsTrayInfo& tray = unit.trays[i];
+      hash = hash_mix(hash, tray.present ? 1U : 0U);
+      hash = hash_mix(hash, tray.active ? 1U : 0U);
+      hash = hash_mix(hash, tray.color_rgba);
+      hash = hash_mix(hash, tray.remain_pct < 0 ? 0xFFFFFFFFU : static_cast<uint32_t>(tray.remain_pct));
+      hash = hash_string(hash, tray.material_type);
+    }
   }
 
   const AmsTrayInfo& ext = snapshot.ams->external_spool;
@@ -497,6 +553,16 @@ uint32_t ams_ui_signature(const PrinterSnapshot& snapshot) {
   hash = hash_mix(hash, ext.color_rgba);
   hash = hash_mix(hash, ext.remain_pct < 0 ? 0xFFFFFFFFU : static_cast<uint32_t>(ext.remain_pct));
   hash = hash_string(hash, ext.material_type);
+
+  // Fold HMS codes (subset relevant to AMS) into the signature so the error
+  // overlay updates when codes appear/disappear.
+  for (uint64_t code : snapshot.hms_codes) {
+    const uint32_t attr = static_cast<uint32_t>(code >> 32);
+    if (((attr >> 24) & 0xFFU) == 0x07U) {
+      hash = hash_mix(hash, static_cast<uint32_t>(code & 0xFFFFFFFFU));
+      hash = hash_mix(hash, attr);
+    }
+  }
   return hash;
 }
 
@@ -1539,7 +1605,7 @@ void Ui::apply_snapshot(const PrinterSnapshot& snapshot) {
   // cached across page changes so navigating away doesn't create a decode storm.
   std::shared_ptr<std::vector<uint8_t>> pre_decoded_raw;
   lv_image_dsc_t pre_decoded_dsc{};
-  const bool preview_page_active = !scrolling_ && active_page_ == 3;
+  const bool preview_page_active = !scrolling_ && active_page_ == kPageIdxPreview;
   const bool preview_blob_changed =
       snapshot.preview_blob && !snapshot.preview_blob->empty() &&
       last_preview_blob_.get() != snapshot.preview_blob.get();
@@ -1812,171 +1878,37 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   // --- AMS page rendering ---
   const uint8_t ams_count = snapshot.ams ? snapshot.ams->count : 0;
   const uint32_t ams_signature = ams_ui_signature(snapshot);
-  const bool ams_visible = scrolling_ || active_page_ == 1;
+  const bool ams_visible = scrolling_ ||
+      (active_page_ >= kPageIdxAmsFirst && active_page_ <= kPageIdxAmsLast);
   const bool render_ams =
       ams_visible && ams_signature != last_rendered_ams_signature_;
-  if (ams_page_available_ && ams_count > 0 && render_ams) {
+  if (ams_count > 0 && render_ams) {
     last_rendered_ams_signature_ = ams_signature;
-    const AmsUnitInfo& unit = snapshot.ams->units[0];
-    const bool ext_spool_active = snapshot.tray_now == 254 || snapshot.tray_tar == 254;
-
-    // Dynamic layout: shrink AMS pills and shift right when external spool is active.
-    if (ext_spool_active != ams_ext_spool_shown_) {
-      ams_ext_spool_shown_ = ext_spool_active;
-      if (ext_spool_active) {
-        // Shrink: pills 72×140 → 54×108, columns 76 → 58, radius 40 → 30
-        for (int i = 0; i < kMaxAmsTrays; ++i) {
-          lv_obj_set_size(ams_tray_col_[i], 58, LV_SIZE_CONTENT);
-          lv_obj_set_size(ams_tray_rect_[i], 54, 108);
-          lv_obj_set_style_radius(ams_tray_rect_[i], 30, 0);
-          lv_obj_set_width(ams_tray_type_[i], 50);
-          lv_obj_set_size(ams_tray_fill_[i], 54, 0);
-        }
-        // Shift AMS block right, shrink shelf/base proportionally
-        lv_obj_set_size(ams_shelf_, 275, 85);
-        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 38, -55);
-        lv_obj_set_size(ams_base_, 300, 80);
-        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 38, 19);
-        lv_obj_set_size(ams_tray_row_, 310, LV_SIZE_CONTENT);
-        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 38, -30);
-        // Show ext spool pill on the left
-        lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -30);
-        lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
-      } else {
-        // Restore original sizes
-        for (int i = 0; i < kMaxAmsTrays; ++i) {
-          lv_obj_set_size(ams_tray_col_[i], 76, LV_SIZE_CONTENT);
-          lv_obj_set_size(ams_tray_rect_[i], 72, 140);
-          lv_obj_set_style_radius(ams_tray_rect_[i], 40, 0);
-          lv_obj_set_width(ams_tray_type_[i], 68);
-          lv_obj_set_size(ams_tray_fill_[i], 72, 0);
-        }
-        lv_obj_set_size(ams_shelf_, 359, 110);
-        lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -50);
-        lv_obj_set_size(ams_base_, 385, 103);
-        lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 35);
-        lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
-        lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -13);
-        lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+    compute_ams_tray_errors(snapshot);
+    const bool show_unit_labels = ams_count > 1;
+    for (int u = 0; u < kMaxAmsUnits; ++u) {
+      if (u < ams_count) {
+        render_ams_unit(u, snapshot, show_unit_labels);
       }
     }
-
-    // External spool pill styling
-    if (ext_spool_active) {
-      const AmsTrayInfo& ext = snapshot.ams->external_spool;
-      if (ext.color_rgba != 0) {
-        const uint32_t ext_rgb = (ext.color_rgba >> 8) & 0x00FFFFFF;
-        lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(ext_rgb), 0);
-        const bool ext_dark = ((ext_rgb >> 16) & 0xFF) * 299 +
-                              ((ext_rgb >> 8) & 0xFF) * 587 +
-                              (ext_rgb & 0xFF) * 114 < 128000;
-        const lv_color_t txt_col = lv_color_hex(ext_dark ? 0xFFFFFF : 0x000000);
-        lv_obj_set_style_text_color(ams_ext_type_, txt_col, 0);
-        lv_obj_set_style_text_color(ams_ext_mat_, txt_col, 0);
-      } else {
-        lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
-        lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
-      }
-      lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
-      lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
-      lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
-      lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
-      // Show green arrow indicator below ext pill
-      lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x4ADE80), 0);
-      // "EXT" always shown at top; material type below it
-      const char* mat_label = !ext.material_type.empty() ? ext.material_type.c_str() : "";
-      set_label_text_if_changed(ams_ext_mat_, mat_label);
-    }
-
-    const int pill_h = ext_spool_active ? 108 : 140;
-
-    for (int i = 0; i < kMaxAmsTrays; ++i) {
-      const AmsTrayInfo& tray = unit.trays[i];
-      if (tray.present) {
-        const uint32_t rgba = tray.color_rgba;
-        const uint32_t rgb = (rgba >> 8) & 0x00FFFFFF;
-        lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(rgb), 0);
-        lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-        // Active tray: show green triangle indicator below pill
-        if (tray.active) {
-          lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
-          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
-          lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
-          lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x4ADE80), 0);
-        } else {
-          lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
-          lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
-          lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
-          lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
-        }
-        set_label_text_if_changed(ams_tray_type_[i],
-                                  tray.material_type.empty() ? "--" : tray.material_type);
-        // Slot label contrast: light text on dark fill, dark text on light fill
-        const bool is_dark = ((rgb >> 16) & 0xFF) * 299 +
-                             ((rgb >> 8) & 0xFF) * 587 +
-                             (rgb & 0xFF) * 114 < 128000;
-        lv_obj_set_style_text_color(ams_tray_type_[i],
-            lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
-
-        // Filament remaining fill level
-        if (tray.remain_pct >= 0) {
-          const int rect_h = pill_h;
-          const int empty_h = rect_h - (rect_h * tray.remain_pct / 100);
-          lv_obj_set_height(ams_tray_fill_[i], empty_h);
-          lv_obj_align(ams_tray_fill_[i], LV_ALIGN_TOP_MID, 0, 0);
-          lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
-          char pct_buf[8];
-          std::snprintf(pct_buf, sizeof(pct_buf), "%d%%", tray.remain_pct);
-          set_label_text_if_changed(ams_tray_pct_[i], pct_buf);
-          lv_obj_set_style_text_color(ams_tray_pct_[i],
-              lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
-          lv_obj_clear_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
-          lv_obj_align_to(ams_tray_pct_[i], ams_tray_rect_[i],
-                          LV_ALIGN_BOTTOM_MID, 0, -10);
-        } else {
-          lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
-          lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
-        }
-      } else {
-        lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(0x333333), 0);
-        lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-        lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
-        lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
-        lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
-        set_label_text_if_changed(ams_tray_type_[i], "Empty");
-        lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
-      }
-    }
-
-    // Humidity: direct percentage from printer
-    char hum_buf[16] = {};
-    if (unit.humidity_pct >= 0) {
-      std::snprintf(hum_buf, sizeof(hum_buf), "%d%%", unit.humidity_pct);
-    } else {
-      std::snprintf(hum_buf, sizeof(hum_buf), "--%% ");
-    }
-    set_label_text_if_changed(ams_humidity_label_, hum_buf);
-
-    char temp_buf[24] = {};
-    if (unit.temperature_c > 0.0f) {
-      std::snprintf(temp_buf, sizeof(temp_buf), "%.0f%s", unit.temperature_c, kDegreeC);
-    } else {
-      std::snprintf(temp_buf, sizeof(temp_buf), "--%s", kDegreeC);
-    }
-    set_label_text_if_changed(ams_temp_label_, temp_buf);
-
-    set_hidden(ams_tray_row_, false);
-    set_hidden(ams_note_, true);
-  } else if (!ams_page_available_) {
-    last_rendered_ams_signature_ = UINT32_MAX;
-  } else if (ams_visible && ams_signature != last_rendered_ams_signature_) {
+  } else if (render_ams) {
     last_rendered_ams_signature_ = ams_signature;
-    set_hidden(ams_tray_row_, true);
-    set_hidden(ams_ext_col_, true);
-    set_hidden(ams_note_, false);
+    // No AMS — show "No AMS connected" note on the first AMS page only.
+    for (int u = 0; u < kMaxAmsUnits; ++u) {
+      if (ams_tray_row_[u] != nullptr) {
+        set_hidden(ams_tray_row_[u], true);
+      }
+      if (ams_note_[u] != nullptr) {
+        set_hidden(ams_note_[u], u != 0);
+      }
+      for (int s = 0; s < kMaxAmsTrays; ++s) {
+        ams_tray_error_[u][s] = false;
+      }
+    }
+    if (ams_ext_col_ != nullptr) {
+      set_hidden(ams_ext_col_, true);
+    }
+    apply_ams_error_pulse_locked();
   }
 
   const std::string preview_note = preview_note_text(snapshot);
@@ -1987,7 +1919,7 @@ void Ui::apply_snapshot_locked(const PrinterSnapshot& snapshot, bool force_ring_
   if (snapshot.preview_blob && !snapshot.preview_blob->empty()) {
     const bool preview_blob_changed = last_preview_blob_.get() != snapshot.preview_blob.get();
     last_preview_blob_ = snapshot.preview_blob;
-    if (active_page_ == 3) {
+    if (active_page_ == kPageIdxPreview) {
       has_preview_image = ensure_preview_image_loaded_locked(
           preview_blob_changed, std::move(pre_decoded_raw), pre_decoded_dsc);
     } else if (preview_blob_changed) {
@@ -2154,6 +2086,490 @@ void Ui::pulse_anim_exec_cb(void* var, int32_t scale) {
 // Ambient sweep timer (ring_timer_cb, handle_ring_timer) removed — the rotating
 // arc during printing caused excessive LVGL redraws on single-buffered display.
 
+// --- Multi-AMS helpers --------------------------------------------------------
+
+void Ui::build_ams_page(int unit_idx) {
+  if (unit_idx < 0 || unit_idx >= kMaxAmsUnits) return;
+  lv_obj_t* page = ams_pages_[unit_idx];
+  if (page == nullptr) return;
+
+  // Unit header label ("AMS 1..4") — created always, hidden by default.
+  ams_unit_label_[unit_idx] = lv_label_create(page);
+  char unit_label_buf[16];
+  std::snprintf(unit_label_buf, sizeof(unit_label_buf), "AMS %d", unit_idx + 1);
+  set_label_text_if_changed(ams_unit_label_[unit_idx], unit_label_buf);
+  lv_obj_set_style_text_font(ams_unit_label_[unit_idx], &dosis_32, 0);
+  lv_obj_set_style_text_color(ams_unit_label_[unit_idx], lv_color_hex(0xFFFFFF), 0);
+  lv_obj_set_style_text_align(ams_unit_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(ams_unit_label_[unit_idx], LV_ALIGN_TOP_MID, 0, 60);
+  lv_obj_add_flag(ams_unit_label_[unit_idx], LV_OBJ_FLAG_HIDDEN);
+
+  // Gray shelf background (behind upper half of pills)
+  ams_shelf_[unit_idx] = lv_obj_create(page);
+  lv_obj_set_size(ams_shelf_[unit_idx], 359, 110);
+  lv_obj_set_style_radius(ams_shelf_[unit_idx], 20, 0);
+  lv_obj_set_style_bg_color(ams_shelf_[unit_idx], lv_color_hex(0x565656), 0);
+  lv_obj_set_style_bg_opa(ams_shelf_[unit_idx], LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_shelf_[unit_idx], 2, 0);
+  lv_obj_set_style_border_color(ams_shelf_[unit_idx], lv_color_hex(0x888888), 0);
+  lv_obj_set_style_border_opa(ams_shelf_[unit_idx], LV_OPA_COVER, 0);
+  lv_obj_set_style_border_side(ams_shelf_[unit_idx],
+      static_cast<lv_border_side_t>(LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT), 0);
+  lv_obj_align(ams_shelf_[unit_idx], LV_ALIGN_CENTER, 0, -50);
+  lv_obj_clear_flag(ams_shelf_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_shelf_[unit_idx], LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_shelf_[unit_idx]);
+
+  // Dark base behind lower half of pills
+  ams_base_[unit_idx] = lv_obj_create(page);
+  lv_obj_set_size(ams_base_[unit_idx], 385, 103);
+  lv_obj_set_style_radius(ams_base_[unit_idx], 0, 0);
+  lv_obj_set_style_bg_color(ams_base_[unit_idx], lv_color_hex(0x1F1F1F), 0);
+  lv_obj_set_style_bg_opa(ams_base_[unit_idx], LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_base_[unit_idx], 2, 0);
+  lv_obj_set_style_border_color(ams_base_[unit_idx], lv_color_hex(0x888888), 0);
+  lv_obj_set_style_border_opa(ams_base_[unit_idx], LV_OPA_COVER, 0);
+  lv_obj_set_style_border_side(ams_base_[unit_idx], LV_BORDER_SIDE_FULL, 0);
+  lv_obj_align(ams_base_[unit_idx], LV_ALIGN_CENTER, 0, 35);
+  lv_obj_clear_flag(ams_base_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_base_[unit_idx], LV_OBJ_FLAG_CLICKABLE);
+  enable_touch_bubble(ams_base_[unit_idx]);
+
+  ams_tray_row_[unit_idx] = lv_obj_create(page);
+  lv_obj_set_size(ams_tray_row_[unit_idx], 420, LV_SIZE_CONTENT);
+  make_transparent(ams_tray_row_[unit_idx]);
+  lv_obj_set_flex_flow(ams_tray_row_[unit_idx], LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(ams_tray_row_[unit_idx], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(ams_tray_row_[unit_idx], 6, 0);
+  lv_obj_align(ams_tray_row_[unit_idx], LV_ALIGN_CENTER, 0, -13);
+  lv_obj_clear_flag(ams_tray_row_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
+  enable_touch_bubble(ams_tray_row_[unit_idx]);
+
+  for (int i = 0; i < kMaxAmsTrays; ++i) {
+    ams_tray_col_[unit_idx][i] = lv_obj_create(ams_tray_row_[unit_idx]);
+    lv_obj_set_size(ams_tray_col_[unit_idx][i], 76, LV_SIZE_CONTENT);
+    make_transparent(ams_tray_col_[unit_idx][i]);
+    lv_obj_set_flex_flow(ams_tray_col_[unit_idx][i], LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ams_tray_col_[unit_idx][i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ams_tray_col_[unit_idx][i], 4, 0);
+    lv_obj_set_style_pad_all(ams_tray_col_[unit_idx][i], 0, 0);
+    lv_obj_clear_flag(ams_tray_col_[unit_idx][i], LV_OBJ_FLAG_SCROLLABLE);
+
+    ams_tray_rect_[unit_idx][i] = lv_obj_create(ams_tray_col_[unit_idx][i]);
+    lv_obj_set_size(ams_tray_rect_[unit_idx][i], 72, 140);
+    lv_obj_set_style_radius(ams_tray_rect_[unit_idx][i], 40, 0);
+    lv_obj_set_style_bg_color(ams_tray_rect_[unit_idx][i], lv_color_hex(0x333333), 0);
+    lv_obj_set_style_bg_opa(ams_tray_rect_[unit_idx][i], LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ams_tray_rect_[unit_idx][i], 1, 0);
+    lv_obj_set_style_border_color(ams_tray_rect_[unit_idx][i], lv_color_hex(0x555555), 0);
+    lv_obj_set_style_border_opa(ams_tray_rect_[unit_idx][i], LV_OPA_COVER, 0);
+    lv_obj_set_style_outline_width(ams_tray_rect_[unit_idx][i], 0, 0);
+    lv_obj_set_style_pad_all(ams_tray_rect_[unit_idx][i], 0, 0);
+    lv_obj_set_style_clip_corner(ams_tray_rect_[unit_idx][i], true, 0);
+    lv_obj_clear_flag(ams_tray_rect_[unit_idx][i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_rect_[unit_idx][i], LV_OBJ_FLAG_CLICKABLE);
+    // Diamond/rhombus pattern overlay drawn when this slot has an HMS error.
+    lv_obj_add_event_cb(ams_tray_rect_[unit_idx][i], ams_pill_error_overlay_cb,
+                        LV_EVENT_DRAW_POST, &ams_tray_error_[unit_idx][i]);
+
+    ams_tray_type_[unit_idx][i] = lv_label_create(ams_tray_rect_[unit_idx][i]);
+    set_label_text_if_changed(ams_tray_type_[unit_idx][i], "--");
+    lv_obj_set_width(ams_tray_type_[unit_idx][i], 68);
+    lv_label_set_long_mode(ams_tray_type_[unit_idx][i], LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(ams_tray_type_[unit_idx][i], LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(ams_tray_type_[unit_idx][i], &dosis_20, 0);
+    lv_obj_set_style_text_color(ams_tray_type_[unit_idx][i], lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(ams_tray_type_[unit_idx][i], LV_ALIGN_TOP_MID, 0, 10);
+
+    ams_tray_fill_[unit_idx][i] = lv_obj_create(ams_tray_rect_[unit_idx][i]);
+    lv_obj_set_size(ams_tray_fill_[unit_idx][i], 72, 0);
+    lv_obj_set_style_radius(ams_tray_fill_[unit_idx][i], 0, 0);
+    lv_obj_set_style_bg_color(ams_tray_fill_[unit_idx][i], lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(ams_tray_fill_[unit_idx][i], LV_OPA_40, 0);
+    lv_obj_set_style_border_width(ams_tray_fill_[unit_idx][i], 0, 0);
+    lv_obj_align(ams_tray_fill_[unit_idx][i], LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_clear_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+
+    ams_tray_arrow_[unit_idx][i] = lv_obj_create(ams_tray_col_[unit_idx][i]);
+    lv_obj_set_size(ams_tray_arrow_[unit_idx][i], 40, 25);
+    make_transparent(ams_tray_arrow_[unit_idx][i]);
+    lv_obj_set_style_bg_color(ams_tray_arrow_[unit_idx][i], lv_color_hex(0x1F1F1F), 0);
+    lv_obj_set_style_bg_opa(ams_tray_arrow_[unit_idx][i], LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(ams_tray_arrow_[unit_idx][i], 0, 0);
+    lv_obj_clear_flag(ams_tray_arrow_[unit_idx][i], LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_tray_arrow_[unit_idx][i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ams_tray_arrow_[unit_idx][i], ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+  }
+
+  // Floating percentage labels above pills (ignore layout)
+  for (int i = 0; i < kMaxAmsTrays; ++i) {
+    ams_tray_pct_[unit_idx][i] = lv_label_create(page);
+    set_label_text_if_changed(ams_tray_pct_[unit_idx][i], "");
+    lv_obj_set_style_text_font(ams_tray_pct_[unit_idx][i], &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ams_tray_pct_[unit_idx][i], lv_color_hex(0xFFFFFF), 0);
+    lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_IGNORE_LAYOUT);
+  }
+
+  // Humidity pill
+  lv_obj_t* hum_pill = lv_obj_create(page);
+  lv_obj_set_size(hum_pill, 139, 50);
+  lv_obj_set_style_radius(hum_pill, 25, 0);
+  lv_obj_set_style_bg_opa(hum_pill, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_color(hum_pill, lv_color_hex(0x9B9B9B), 0);
+  lv_obj_set_style_border_opa(hum_pill, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(hum_pill, 1, 0);
+  lv_obj_set_style_pad_all(hum_pill, 0, 0);
+  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 135);
+  lv_obj_clear_flag(hum_pill, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(hum_pill, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(hum_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(hum_pill, 8, 0);
+
+  ams_humidity_drop_[unit_idx] = lv_obj_create(hum_pill);
+  lv_obj_set_size(ams_humidity_drop_[unit_idx], 14, 14);
+  lv_obj_set_style_radius(ams_humidity_drop_[unit_idx], LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(ams_humidity_drop_[unit_idx], lv_color_hex(0x4A90D9), 0);
+  lv_obj_set_style_bg_opa(ams_humidity_drop_[unit_idx], LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ams_humidity_drop_[unit_idx], 0, 0);
+  lv_obj_clear_flag(ams_humidity_drop_[unit_idx], LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(ams_humidity_drop_[unit_idx], LV_OBJ_FLAG_CLICKABLE);
+
+  ams_humidity_label_[unit_idx] = lv_label_create(hum_pill);
+  set_label_text_if_changed(ams_humidity_label_[unit_idx], "--");
+  lv_obj_set_style_text_font(ams_humidity_label_[unit_idx], &dosis_20, 0);
+  lv_obj_set_style_text_color(ams_humidity_label_[unit_idx], lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_align(ams_humidity_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
+
+  ams_temp_label_[unit_idx] = lv_label_create(hum_pill);
+  set_label_text_if_changed(ams_temp_label_[unit_idx], "--\xC2\xB0""C");
+  lv_obj_set_style_text_font(ams_temp_label_[unit_idx], &dosis_20, 0);
+  lv_obj_set_style_text_color(ams_temp_label_[unit_idx], lv_color_hex(0x94A3B8), 0);
+  lv_obj_set_style_text_align(ams_temp_label_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
+
+  // External-spool widgets only on the first AMS page.
+  if (unit_idx == 0) {
+    ams_ext_col_ = lv_obj_create(page);
+    lv_obj_set_size(ams_ext_col_, 56, LV_SIZE_CONTENT);
+    make_transparent(ams_ext_col_);
+    lv_obj_set_flex_flow(ams_ext_col_, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(ams_ext_col_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(ams_ext_col_, 4, 0);
+    lv_obj_set_style_pad_all(ams_ext_col_, 0, 0);
+    lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+
+    ams_ext_rect_ = lv_obj_create(ams_ext_col_);
+    lv_obj_set_size(ams_ext_rect_, 52, 108);
+    lv_obj_set_style_radius(ams_ext_rect_, 32, 0);
+    lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
+    lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
+    lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_border_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+    lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
+    lv_obj_set_style_pad_all(ams_ext_rect_, 0, 0);
+    lv_obj_set_style_clip_corner(ams_ext_rect_, true, 0);
+    lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_CLICKABLE);
+
+    ams_ext_type_ = lv_label_create(ams_ext_rect_);
+    set_label_text_if_changed(ams_ext_type_, "EXT");
+    lv_obj_set_width(ams_ext_type_, 48);
+    lv_label_set_long_mode(ams_ext_type_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(ams_ext_type_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(ams_ext_type_, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(ams_ext_type_, LV_ALIGN_CENTER, 0, 8);
+
+    ams_ext_mat_ = lv_label_create(ams_ext_rect_);
+    set_label_text_if_changed(ams_ext_mat_, "");
+    lv_obj_set_width(ams_ext_mat_, 48);
+    lv_label_set_long_mode(ams_ext_mat_, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(ams_ext_mat_, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
+
+    ams_ext_arrow_ = lv_obj_create(ams_ext_col_);
+    lv_obj_set_size(ams_ext_arrow_, 35, 23);
+    make_transparent(ams_ext_arrow_);
+    lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x1F1F1F), 0);
+    lv_obj_set_style_bg_opa(ams_ext_arrow_, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(ams_ext_arrow_, 0, 0);
+    lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(ams_ext_arrow_, ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+  }
+
+  ams_note_[unit_idx] = lv_label_create(page);
+  set_label_text_if_changed(ams_note_[unit_idx], "No AMS connected");
+  lv_obj_set_width(ams_note_[unit_idx], 280);
+  lv_label_set_long_mode(ams_note_[unit_idx], LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_align(ams_note_[unit_idx], LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_font(ams_note_[unit_idx], &dosis_20, 0);
+  lv_obj_set_style_text_color(ams_note_[unit_idx], lv_color_hex(0x666666), 0);
+  lv_obj_align(ams_note_[unit_idx], LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(ams_note_[unit_idx], LV_OBJ_FLAG_HIDDEN);
+}
+
+void Ui::compute_ams_tray_errors(const PrinterSnapshot& snapshot) {
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    for (int s = 0; s < kMaxAmsTrays; ++s) {
+      ams_tray_error_[u][s] = false;
+    }
+  }
+  for (uint64_t code : snapshot.hms_codes) {
+    const uint32_t attr = static_cast<uint32_t>(code >> 32);
+    const uint8_t module_id = (attr >> 24) & 0xFFU;
+    if (module_id != 0x07U) continue;  // not an AMS-class HMS code
+    const uint8_t module_num = (attr >> 16) & 0xFFU;
+    int unit_idx = (module_num >= 128) ? (module_num - 128) : module_num;
+    if (unit_idx < 0 || unit_idx >= kMaxAmsUnits) continue;
+    const uint8_t part_id = (attr >> 8) & 0xFFU;
+    // Slot mapping (BambuStudio convention): part_id values 0x20..0x23 map to
+    // slots 0..3. Other part_id values describe unit-level errors and are
+    // ignored for per-slot overlay (a unit-level indicator could be added
+    // later via a shared marker on ams_unit_label_).
+    if (part_id >= 0x20U && part_id <= 0x20U + (kMaxAmsTrays - 1)) {
+      const int slot_idx = part_id - 0x20U;
+      ams_tray_error_[unit_idx][slot_idx] = true;
+    }
+  }
+  apply_ams_error_pulse_locked();
+}
+
+void Ui::ams_error_pulse_timer_cb(lv_timer_t* timer) {
+  auto* ui = static_cast<Ui*>(lv_timer_get_user_data(timer));
+  if (ui == nullptr) return;
+  ui->ams_error_pulse_phase_ = (ui->ams_error_pulse_phase_ + 1U) & 0x3FU;
+  // Triangle wave 0..32 → blend factor between dark and red. The arrow stays
+  // fully opaque (LV_OPA_COVER); only the color changes, so it never bleeds
+  // through the pill background like opacity-based pulsing did.
+  const int32_t phase = static_cast<int32_t>(ui->ams_error_pulse_phase_);
+  const int32_t tri = phase < 32 ? phase : (64 - phase);  // 0..32
+  // Blend factor 0..255 (with a small floor so the dim end stays visible).
+  const int32_t mix = 60 + tri * 6;  // 60..252
+  // Lerp 0x1F1F1F → 0xEF4444
+  const int32_t r = (0x1F * (255 - mix) + 0xEF * mix) / 255;
+  const int32_t g = (0x1F * (255 - mix) + 0x44 * mix) / 255;
+  const int32_t b = (0x1F * (255 - mix) + 0x44 * mix) / 255;
+  const lv_color_t col = lv_color_hex(
+      (static_cast<uint32_t>(r) << 16) |
+      (static_cast<uint32_t>(g) << 8) |
+      static_cast<uint32_t>(b));
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    for (int s = 0; s < kMaxAmsTrays; ++s) {
+      if (!ui->ams_tray_error_[u][s]) continue;
+      lv_obj_t* arrow = ui->ams_tray_arrow_[u][s];
+      if (arrow == nullptr) continue;
+      lv_obj_set_style_bg_color(arrow, col, 0);
+      lv_obj_invalidate(arrow);
+    }
+  }
+}
+
+void Ui::apply_ams_error_pulse_locked() {
+  bool any_error = false;
+  for (int u = 0; u < kMaxAmsUnits && !any_error; ++u) {
+    for (int s = 0; s < kMaxAmsTrays && !any_error; ++s) {
+      if (ams_tray_error_[u][s]) any_error = true;
+    }
+  }
+
+  // Force pill redraw so the rhombus overlay event-cb re-runs with the new
+  // flag value. Arrow color/opacity is owned by render_ams_unit() (non-error)
+  // and the pulse timer (error) — we must not override it here, otherwise we
+  // would clobber the green "active" indicator on non-error slots.
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    for (int s = 0; s < kMaxAmsTrays; ++s) {
+      if (ams_tray_rect_[u][s] != nullptr) {
+        lv_obj_invalidate(ams_tray_rect_[u][s]);
+      }
+    }
+  }
+
+  if (any_error && ams_error_pulse_timer_ == nullptr) {
+    ams_error_pulse_timer_ = lv_timer_create(&Ui::ams_error_pulse_timer_cb, 60, this);
+  } else if (!any_error && ams_error_pulse_timer_ != nullptr) {
+    lv_timer_delete(ams_error_pulse_timer_);
+    ams_error_pulse_timer_ = nullptr;
+    ams_error_pulse_phase_ = 0;
+  }
+}
+
+void Ui::render_ams_unit(int unit_idx, const PrinterSnapshot& snapshot, bool show_unit_label) {
+  if (unit_idx < 0 || unit_idx >= kMaxAmsUnits) return;
+  if (snapshot.ams == nullptr) return;
+  const AmsUnitInfo& unit = snapshot.ams->units[unit_idx];
+
+  // Unit header label
+  if (ams_unit_label_[unit_idx] != nullptr) {
+    set_hidden(ams_unit_label_[unit_idx], !show_unit_label);
+  }
+
+  const bool ext_spool_active =
+      unit_idx == 0 && (snapshot.tray_now == 254 || snapshot.tray_tar == 254);
+
+  // Dynamic ext-spool layout shrink — only on AMS page 0.
+  if (unit_idx == 0 && ext_spool_active != ams_ext_spool_shown_) {
+    ams_ext_spool_shown_ = ext_spool_active;
+    if (ext_spool_active) {
+      for (int i = 0; i < kMaxAmsTrays; ++i) {
+        lv_obj_set_size(ams_tray_col_[0][i], 58, LV_SIZE_CONTENT);
+        lv_obj_set_size(ams_tray_rect_[0][i], 54, 108);
+        lv_obj_set_style_radius(ams_tray_rect_[0][i], 30, 0);
+        lv_obj_set_width(ams_tray_type_[0][i], 50);
+        lv_obj_set_size(ams_tray_fill_[0][i], 54, 0);
+      }
+      lv_obj_set_size(ams_shelf_[0], 275, 85);
+      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, 38, -55);
+      lv_obj_set_size(ams_base_[0], 300, 80);
+      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, 38, 19);
+      lv_obj_set_size(ams_tray_row_[0], 310, LV_SIZE_CONTENT);
+      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, 38, -30);
+      lv_obj_align(ams_ext_col_, LV_ALIGN_CENTER, -155, -30);
+      lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+      for (int i = 0; i < kMaxAmsTrays; ++i) {
+        lv_obj_set_size(ams_tray_col_[0][i], 76, LV_SIZE_CONTENT);
+        lv_obj_set_size(ams_tray_rect_[0][i], 72, 140);
+        lv_obj_set_style_radius(ams_tray_rect_[0][i], 40, 0);
+        lv_obj_set_width(ams_tray_type_[0][i], 68);
+        lv_obj_set_size(ams_tray_fill_[0][i], 72, 0);
+      }
+      lv_obj_set_size(ams_shelf_[0], 359, 110);
+      lv_obj_align(ams_shelf_[0], LV_ALIGN_CENTER, 0, -50);
+      lv_obj_set_size(ams_base_[0], 385, 103);
+      lv_obj_align(ams_base_[0], LV_ALIGN_CENTER, 0, 35);
+      lv_obj_set_size(ams_tray_row_[0], 420, LV_SIZE_CONTENT);
+      lv_obj_align(ams_tray_row_[0], LV_ALIGN_CENTER, 0, -13);
+      lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  // External spool styling (only on unit 0 when active).
+  if (unit_idx == 0 && ext_spool_active) {
+    const AmsTrayInfo& ext = snapshot.ams->external_spool;
+    if (ext.color_rgba != 0) {
+      const uint32_t ext_rgb = (ext.color_rgba >> 8) & 0x00FFFFFF;
+      lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(ext_rgb), 0);
+      const bool ext_dark = ((ext_rgb >> 16) & 0xFF) * 299 +
+                            ((ext_rgb >> 8) & 0xFF) * 587 +
+                            (ext_rgb & 0xFF) * 114 < 128000;
+      const lv_color_t txt_col = lv_color_hex(ext_dark ? 0xFFFFFF : 0x000000);
+      lv_obj_set_style_text_color(ams_ext_type_, txt_col, 0);
+      lv_obj_set_style_text_color(ams_ext_mat_, txt_col, 0);
+    } else {
+      lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
+      lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
+      lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
+    }
+    lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
+    lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
+    lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
+    lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x4ADE80), 0);
+    const char* mat_label = !ext.material_type.empty() ? ext.material_type.c_str() : "";
+    set_label_text_if_changed(ams_ext_mat_, mat_label);
+  }
+
+  const int pill_h = (unit_idx == 0 && ext_spool_active) ? 108 : 140;
+
+  for (int i = 0; i < kMaxAmsTrays; ++i) {
+    const AmsTrayInfo& tray = unit.trays[i];
+    lv_obj_t* rect = ams_tray_rect_[unit_idx][i];
+    lv_obj_t* arrow = ams_tray_arrow_[unit_idx][i];
+    const bool has_error = ams_tray_error_[unit_idx][i];
+    if (tray.present) {
+      const uint32_t rgba = tray.color_rgba;
+      const uint32_t rgb = (rgba >> 8) & 0x00FFFFFF;
+      lv_obj_set_style_bg_color(rect, lv_color_hex(rgb), 0);
+      lv_obj_set_style_bg_opa(rect, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(rect, 1, 0);
+      lv_obj_set_style_border_color(rect, lv_color_hex(0x555555), 0);
+      lv_obj_set_style_outline_width(rect, 0, 0);
+      if (has_error) {
+        // Red triangle on error (opacity pulses via timer).
+        lv_obj_set_style_bg_color(arrow, lv_color_hex(0xEF4444), 0);
+      } else if (tray.active) {
+        lv_obj_set_style_bg_color(arrow, lv_color_hex(0x4ADE80), 0);
+        lv_obj_set_style_bg_opa(arrow, LV_OPA_COVER, 0);
+      } else {
+        lv_obj_set_style_bg_color(arrow, lv_color_hex(0x1F1F1F), 0);
+        lv_obj_set_style_bg_opa(arrow, LV_OPA_COVER, 0);
+      }
+      set_label_text_if_changed(ams_tray_type_[unit_idx][i],
+                                tray.material_type.empty() ? "--" : tray.material_type);
+      const bool is_dark = ((rgb >> 16) & 0xFF) * 299 +
+                           ((rgb >> 8) & 0xFF) * 587 +
+                           (rgb & 0xFF) * 114 < 128000;
+      lv_obj_set_style_text_color(ams_tray_type_[unit_idx][i],
+          lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
+
+      if (tray.remain_pct >= 0) {
+        const int empty_h = pill_h - (pill_h * tray.remain_pct / 100);
+        lv_obj_set_height(ams_tray_fill_[unit_idx][i], empty_h);
+        lv_obj_align(ams_tray_fill_[unit_idx][i], LV_ALIGN_TOP_MID, 0, 0);
+        lv_obj_clear_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+        char pct_buf[8];
+        std::snprintf(pct_buf, sizeof(pct_buf), "%d%%", tray.remain_pct);
+        set_label_text_if_changed(ams_tray_pct_[unit_idx][i], pct_buf);
+        lv_obj_set_style_text_color(ams_tray_pct_[unit_idx][i],
+            lv_color_hex(is_dark ? 0xFFFFFF : 0x000000), 0);
+        lv_obj_clear_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_align_to(ams_tray_pct_[unit_idx][i], rect,
+                        LV_ALIGN_BOTTOM_MID, 0, -10);
+      } else {
+        lv_obj_add_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+      }
+    } else {
+      lv_obj_set_style_bg_color(rect, lv_color_hex(0x333333), 0);
+      lv_obj_set_style_bg_opa(rect, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(rect, 1, 0);
+      lv_obj_set_style_border_color(rect, lv_color_hex(0x555555), 0);
+      lv_obj_set_style_outline_width(rect, 0, 0);
+      set_label_text_if_changed(ams_tray_type_[unit_idx][i], "Empty");
+      lv_obj_add_flag(ams_tray_fill_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(ams_tray_pct_[unit_idx][i], LV_OBJ_FLAG_HIDDEN);
+      if (has_error) {
+        lv_obj_set_style_bg_color(arrow, lv_color_hex(0xEF4444), 0);
+      } else {
+        lv_obj_set_style_bg_color(arrow, lv_color_hex(0x1F1F1F), 0);
+        lv_obj_set_style_bg_opa(arrow, LV_OPA_COVER, 0);
+      }
+    }
+  }
+
+  // Humidity + temperature
+  char hum_buf[16] = {};
+  if (unit.humidity_pct >= 0) {
+    std::snprintf(hum_buf, sizeof(hum_buf), "%d%%", unit.humidity_pct);
+  } else {
+    std::snprintf(hum_buf, sizeof(hum_buf), "--%% ");
+  }
+  set_label_text_if_changed(ams_humidity_label_[unit_idx], hum_buf);
+
+  char temp_buf[24] = {};
+  if (unit.temperature_c > 0.0f) {
+    std::snprintf(temp_buf, sizeof(temp_buf), "%.0f%s", unit.temperature_c, kDegreeC);
+  } else {
+    std::snprintf(temp_buf, sizeof(temp_buf), "--%s", kDegreeC);
+  }
+  set_label_text_if_changed(ams_temp_label_[unit_idx], temp_buf);
+
+  set_hidden(ams_tray_row_[unit_idx], false);
+  set_hidden(ams_note_[unit_idx], true);
+}
+
 esp_err_t Ui::build_dashboard() {
   LvglLockGuard lock(3000, "build_dashboard");
   if (!lock.locked()) {
@@ -2197,12 +2613,14 @@ esp_err_t Ui::build_dashboard() {
   };
 
   page0_ = create_page(pager_);
-  ams_page_ = create_page(pager_);
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    ams_pages_[u] = create_page(pager_);
+    enable_touch_bubble(ams_pages_[u]);
+  }
   page1_ = create_page(pager_);
   page2_ = create_page(pager_);
   page3_ = create_page(pager_);
   enable_touch_bubble(page0_);
-  enable_touch_bubble(ams_page_);
   enable_touch_bubble(page1_);
   enable_touch_bubble(page2_);
   enable_touch_bubble(page3_);
@@ -2238,230 +2656,17 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_align(page0_empty_note_, LV_ALIGN_CENTER, 0, 20);
   lv_obj_add_flag(page0_empty_note_, LV_OBJ_FLAG_HIDDEN);
 
-  // --- AMS page (page index 1) ---
-  // Pure LVGL spool visualization (no bitmap image).
-  // Layout: gray shelf + dark base background, 4 pill-shaped spool rects,
-  //         humidity pill indicator below.
-
-  // Gray shelf background (behind upper half of pills)
-  ams_shelf_ = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_shelf_, 359, 110);
-  lv_obj_set_style_radius(ams_shelf_, 20, 0);
-  lv_obj_set_style_bg_color(ams_shelf_, lv_color_hex(0x565656), 0);
-  lv_obj_set_style_bg_opa(ams_shelf_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_shelf_, 2, 0);
-  lv_obj_set_style_border_color(ams_shelf_, lv_color_hex(0x888888), 0);
-  lv_obj_set_style_border_opa(ams_shelf_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_side(ams_shelf_, static_cast<lv_border_side_t>(LV_BORDER_SIDE_TOP | LV_BORDER_SIDE_LEFT | LV_BORDER_SIDE_RIGHT), 0);
-  lv_obj_align(ams_shelf_, LV_ALIGN_CENTER, 0, -50);
-  lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_shelf_, LV_OBJ_FLAG_CLICKABLE);
-  enable_touch_bubble(ams_shelf_);
-
-  // Dark base behind lower half of pills (solid, hides shelf's bottom corners)
-  ams_base_ = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_base_, 385, 103);
-  lv_obj_set_style_radius(ams_base_, 0, 0);
-  lv_obj_set_style_bg_color(ams_base_, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_set_style_bg_opa(ams_base_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_base_, 2, 0);
-  lv_obj_set_style_border_color(ams_base_, lv_color_hex(0x888888), 0);
-  lv_obj_set_style_border_opa(ams_base_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_side(ams_base_, LV_BORDER_SIDE_FULL, 0);
-  lv_obj_align(ams_base_, LV_ALIGN_CENTER, 0, 35);
-  lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_base_, LV_OBJ_FLAG_CLICKABLE);
-  enable_touch_bubble(ams_base_);
-
-  ams_tray_row_ = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_tray_row_, 420, LV_SIZE_CONTENT);
-  make_transparent(ams_tray_row_);
-  lv_obj_set_flex_flow(ams_tray_row_, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(ams_tray_row_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START,
-                        LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(ams_tray_row_, 6, 0);
-  lv_obj_align(ams_tray_row_, LV_ALIGN_CENTER, 0, -13);
-  lv_obj_clear_flag(ams_tray_row_, LV_OBJ_FLAG_SCROLLABLE);
-  enable_touch_bubble(ams_tray_row_);
-
-  for (int i = 0; i < kMaxAmsTrays; ++i) {
-    // Column: type label on top, colored rect, color name below
-    ams_tray_col_[i] = lv_obj_create(ams_tray_row_);
-    lv_obj_set_size(ams_tray_col_[i], 76, LV_SIZE_CONTENT);
-    make_transparent(ams_tray_col_[i]);
-    lv_obj_set_flex_flow(ams_tray_col_[i], LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(ams_tray_col_[i], LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_row(ams_tray_col_[i], 4, 0);
-    lv_obj_set_style_pad_all(ams_tray_col_[i], 0, 0);
-    lv_obj_clear_flag(ams_tray_col_[i], LV_OBJ_FLAG_SCROLLABLE);
-
-    // Pill-shaped spool rectangle
-    ams_tray_rect_[i] = lv_obj_create(ams_tray_col_[i]);
-    lv_obj_set_size(ams_tray_rect_[i], 72, 140);
-    lv_obj_set_style_radius(ams_tray_rect_[i], 40, 0);
-    lv_obj_set_style_bg_color(ams_tray_rect_[i], lv_color_hex(0x333333), 0);
-    lv_obj_set_style_bg_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(ams_tray_rect_[i], 1, 0);
-    lv_obj_set_style_border_color(ams_tray_rect_[i], lv_color_hex(0x555555), 0);
-    lv_obj_set_style_border_opa(ams_tray_rect_[i], LV_OPA_COVER, 0);
-    lv_obj_set_style_outline_width(ams_tray_rect_[i], 0, 0);
-    lv_obj_set_style_pad_all(ams_tray_rect_[i], 0, 0);
-    lv_obj_set_style_clip_corner(ams_tray_rect_[i], true, 0);
-    lv_obj_clear_flag(ams_tray_rect_[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(ams_tray_rect_[i], LV_OBJ_FLAG_CLICKABLE);
-
-    // Material type label inside pill upper area (e.g. "PLA")
-    ams_tray_type_[i] = lv_label_create(ams_tray_rect_[i]);
-    set_label_text_if_changed(ams_tray_type_[i], "--");
-    lv_obj_set_width(ams_tray_type_[i], 68);
-    lv_label_set_long_mode(ams_tray_type_[i], LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_align(ams_tray_type_[i], LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(ams_tray_type_[i], dosis20, 0);
-    lv_obj_set_style_text_color(ams_tray_type_[i], lv_color_hex(0xFFFFFF), 0);
-    lv_obj_align(ams_tray_type_[i], LV_ALIGN_TOP_MID, 0, 10);
-
-    // Dark overlay covering the empty portion from top (fill level indicator)
-    ams_tray_fill_[i] = lv_obj_create(ams_tray_rect_[i]);
-    lv_obj_set_size(ams_tray_fill_[i], 72, 0);
-    lv_obj_set_style_radius(ams_tray_fill_[i], 0, 0);
-    lv_obj_set_style_bg_color(ams_tray_fill_[i], lv_color_hex(0x000000), 0);
-    lv_obj_set_style_bg_opa(ams_tray_fill_[i], LV_OPA_40, 0);
-    lv_obj_set_style_border_width(ams_tray_fill_[i], 0, 0);
-    lv_obj_align(ams_tray_fill_[i], LV_ALIGN_TOP_MID, 0, 0);
-    lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(ams_tray_fill_[i], LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_flag(ams_tray_fill_[i], LV_OBJ_FLAG_HIDDEN);
-
-    // Triangle indicator below the pill (color-switched: green=active, base=inactive)
-    ams_tray_arrow_[i] = lv_obj_create(ams_tray_col_[i]);
-    lv_obj_set_size(ams_tray_arrow_[i], 40, 25);
-    make_transparent(ams_tray_arrow_[i]);
-    lv_obj_set_style_bg_color(ams_tray_arrow_[i], lv_color_hex(0x1F1F1F), 0);
-    lv_obj_set_style_pad_all(ams_tray_arrow_[i], 0, 0);
-    lv_obj_clear_flag(ams_tray_arrow_[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(ams_tray_arrow_[i], LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(ams_tray_arrow_[i], ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
+  // --- AMS pages (one per AMS unit, indices kPageIdxAmsFirst..kPageIdxAmsLast) ---
+  // Build all kMaxAmsUnits AMS pages up front; each page is hidden until the
+  // backend reports a corresponding unit. The first AMS page additionally hosts
+  // the external-spool widgets (which dynamically shrink that page's pills).
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    build_ams_page(u);
+    lv_obj_add_flag(ams_pages_[u], LV_OBJ_FLAG_HIDDEN);
+    ams_unit_present_[u] = false;
   }
-
-  // Percentage labels (above pills, ignore layout so they float)
-  for (int i = 0; i < kMaxAmsTrays; ++i) {
-    ams_tray_pct_[i] = lv_label_create(ams_page_);
-    set_label_text_if_changed(ams_tray_pct_[i], "");
-    lv_obj_set_style_text_font(ams_tray_pct_[i], info20, 0);
-    lv_obj_set_style_text_color(ams_tray_pct_[i], lv_color_hex(0xFFFFFF), 0);
-    lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ams_tray_pct_[i], LV_OBJ_FLAG_IGNORE_LAYOUT);
-  }
-
-  // Humidity indicator in a pill-shaped bordered container
-  lv_obj_t* hum_pill = lv_obj_create(ams_page_);
-  lv_obj_set_size(hum_pill, 139, 50);
-  lv_obj_set_style_radius(hum_pill, 25, 0);
-  lv_obj_set_style_bg_opa(hum_pill, LV_OPA_TRANSP, 0);
-  lv_obj_set_style_border_color(hum_pill, lv_color_hex(0x9B9B9B), 0);
-  lv_obj_set_style_border_opa(hum_pill, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(hum_pill, 1, 0);
-  lv_obj_set_style_pad_all(hum_pill, 0, 0);
-  lv_obj_align(hum_pill, LV_ALIGN_CENTER, 0, 135);
-  lv_obj_clear_flag(hum_pill, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(hum_pill, LV_FLEX_FLOW_ROW);
-  lv_obj_set_flex_align(hum_pill, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_column(hum_pill, 8, 0);
-
-  // Water drop icon (simple circle as placeholder)
-  ams_humidity_drop_ = lv_obj_create(hum_pill);
-  lv_obj_set_size(ams_humidity_drop_, 14, 14);
-  lv_obj_set_style_radius(ams_humidity_drop_, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_color(ams_humidity_drop_, lv_color_hex(0x4A90D9), 0);
-  lv_obj_set_style_bg_opa(ams_humidity_drop_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_humidity_drop_, 0, 0);
-  lv_obj_clear_flag(ams_humidity_drop_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_humidity_drop_, LV_OBJ_FLAG_CLICKABLE);
-
-  ams_humidity_label_ = lv_label_create(hum_pill);
-  set_label_text_if_changed(ams_humidity_label_, "--");
-  lv_obj_set_style_text_font(ams_humidity_label_, dosis20, 0);
-  lv_obj_set_style_text_color(ams_humidity_label_, lv_color_hex(0x94A3B8), 0);
-  lv_obj_set_style_text_align(ams_humidity_label_, LV_TEXT_ALIGN_CENTER, 0);
-
-  ams_temp_label_ = lv_label_create(hum_pill);
-  set_label_text_if_changed(ams_temp_label_, "--\xC2\xB0""C");
-  lv_obj_set_style_text_font(ams_temp_label_, dosis20, 0);
-  lv_obj_set_style_text_color(ams_temp_label_, lv_color_hex(0x94A3B8), 0);
-  lv_obj_set_style_text_align(ams_temp_label_, LV_TEXT_ALIGN_CENTER, 0);
-
-  // External spool pill (shown when tray_now == 254 or tray_tar == 254)
-  ams_ext_col_ = lv_obj_create(ams_page_);
-  lv_obj_set_size(ams_ext_col_, 56, LV_SIZE_CONTENT);
-  make_transparent(ams_ext_col_);
-  lv_obj_set_flex_flow(ams_ext_col_, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(ams_ext_col_, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                        LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(ams_ext_col_, 4, 0);
-  lv_obj_set_style_pad_all(ams_ext_col_, 0, 0);
-  lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_IGNORE_LAYOUT);
-  lv_obj_clear_flag(ams_ext_col_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_add_flag(ams_ext_col_, LV_OBJ_FLAG_HIDDEN);
-
-  ams_ext_rect_ = lv_obj_create(ams_ext_col_);
-  lv_obj_set_size(ams_ext_rect_, 52, 108);
-  lv_obj_set_style_radius(ams_ext_rect_, 32, 0);
-  lv_obj_set_style_bg_color(ams_ext_rect_, lv_color_hex(0x444444), 0);
-  lv_obj_set_style_bg_opa(ams_ext_rect_, LV_OPA_COVER, 0);
-  lv_obj_set_style_border_width(ams_ext_rect_, 1, 0);
-  lv_obj_set_style_border_color(ams_ext_rect_, lv_color_hex(0x555555), 0);
-  lv_obj_set_style_border_opa(ams_ext_rect_, LV_OPA_COVER, 0);
-  lv_obj_set_style_outline_width(ams_ext_rect_, 0, 0);
-  lv_obj_set_style_pad_all(ams_ext_rect_, 0, 0);
-  lv_obj_set_style_clip_corner(ams_ext_rect_, true, 0);
-  lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_ext_rect_, LV_OBJ_FLAG_CLICKABLE);
-
-  ams_ext_type_ = lv_label_create(ams_ext_rect_);
-  set_label_text_if_changed(ams_ext_type_, "EXT");
-  lv_obj_set_width(ams_ext_type_, 48);
-  lv_label_set_long_mode(ams_ext_type_, LV_LABEL_LONG_DOT);
-  lv_obj_set_style_text_align(ams_ext_type_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(ams_ext_type_, info20, 0);
-  lv_obj_set_style_text_color(ams_ext_type_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(ams_ext_type_, LV_ALIGN_CENTER, 0, 8);
-
-  ams_ext_mat_ = lv_label_create(ams_ext_rect_);
-  set_label_text_if_changed(ams_ext_mat_, "");
-  lv_obj_set_width(ams_ext_mat_, 48);
-  lv_label_set_long_mode(ams_ext_mat_, LV_LABEL_LONG_DOT);
-  lv_obj_set_style_text_align(ams_ext_mat_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(ams_ext_mat_, &lv_font_montserrat_14, 0);
-  lv_obj_set_style_text_color(ams_ext_mat_, lv_color_hex(0xFFFFFF), 0);
-  lv_obj_align(ams_ext_mat_, LV_ALIGN_TOP_MID, 0, 12);
-
-  // Triangle indicator below the ext pill (color-switched: green=active, base=inactive)
-  ams_ext_arrow_ = lv_obj_create(ams_ext_col_);
-  lv_obj_set_size(ams_ext_arrow_, 35, 23);
-  make_transparent(ams_ext_arrow_);
-  lv_obj_set_style_bg_color(ams_ext_arrow_, lv_color_hex(0x1F1F1F), 0);
-  lv_obj_set_style_pad_all(ams_ext_arrow_, 0, 0);
-  lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_clear_flag(ams_ext_arrow_, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(ams_ext_arrow_, ams_arrow_draw_cb, LV_EVENT_DRAW_MAIN, nullptr);
-
   ams_ext_spool_shown_ = false;
 
-  ams_note_ = lv_label_create(ams_page_);
-  set_label_text_if_changed(ams_note_, "No AMS connected");
-  lv_obj_set_width(ams_note_, 280);
-  lv_label_set_long_mode(ams_note_, LV_LABEL_LONG_WRAP);
-  lv_obj_set_style_text_align(ams_note_, LV_TEXT_ALIGN_CENTER, 0);
-  lv_obj_set_style_text_font(ams_note_, dosis20, 0);
-  lv_obj_set_style_text_color(ams_note_, lv_color_hex(0x666666), 0);
-  lv_obj_align(ams_note_, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_add_flag(ams_note_, LV_OBJ_FLAG_HIDDEN);
-
-  // AMS page starts hidden until data says there's an AMS
-  lv_obj_add_flag(ams_page_, LV_OBJ_FLAG_HIDDEN);
-  ams_page_available_ = false;
 
   fixed_overlay_ = lv_obj_create(screen_);
   lv_obj_set_size(fixed_overlay_, board::kDisplayWidth, board::kDisplayHeight);
@@ -2765,7 +2970,7 @@ esp_err_t Ui::build_dashboard() {
   lv_obj_update_layout(pager_);
   lv_obj_scroll_to_view(page1_, LV_ANIM_OFF);
 
-  active_page_ = 2;
+  active_page_ = kPageIdxMain;
   scrolling_ = false;
   deferred_snapshot_pending_ = false;
   detail_visible_ = true;
@@ -2785,20 +2990,22 @@ void Ui::apply_page_visibility() {
   // during a scroll gesture.  Keeping them visible produces a smooth gallery-
   // like swipe transition where the departing and arriving pages render side by
   // side while the user's finger drags.
-  const bool on_page1 = !scrolling_ ? (active_page_ == 2) : true;
-  const bool on_page2 = !scrolling_ ? (active_page_ == 3) : true;
-  const bool on_page3 = !scrolling_ ? (active_page_ == 4) : true;
-  const bool settled_page1 = !scrolling_ && active_page_ == 2;
+  const bool on_page1 = !scrolling_ ? (active_page_ == kPageIdxMain) : true;
+  const bool on_page2 = !scrolling_ ? (active_page_ == kPageIdxPreview) : true;
+  const bool on_page3 = !scrolling_ ? (active_page_ == kPageIdxCamera) : true;
+  const bool settled_page1 = !scrolling_ && active_page_ == kPageIdxMain;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_portal_hint =
       settled_page1 && !portal_hint_text_.empty() &&
       (portal_hint_has_priority || !detail_visible_);
 
-  set_hidden(ams_page_, !ams_page_available_);
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    if (ams_pages_[u] != nullptr) {
+      set_hidden(ams_pages_[u], !ams_unit_present_[u]);
+    }
+  }
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
-
-  // Page 1 detail labels
   set_hidden(status_label_, !on_page1);
   set_hidden(detail_label_, !on_page1 || !detail_visible_ || show_portal_hint);
   set_hidden(layer_label_, !on_page1);
@@ -2826,7 +3033,7 @@ void Ui::apply_page_visibility() {
 
 void Ui::apply_logo_visibility() {
   // badge_slot_ is a child of page1_ so it clips naturally during scroll.
-  const bool show_badge_slot = scrolling_ || active_page_ == 2;
+  const bool show_badge_slot = scrolling_ || active_page_ == kPageIdxMain;
   if (!show_badge_slot) {
     set_hidden(logo_badge_, true);
     return;
@@ -2838,20 +3045,31 @@ void Ui::apply_logo_visibility() {
 void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
   const bool preview_available = snapshot.preview_page_available;
   const bool camera_available = snapshot.camera_page_available;
-  const bool ams_available = snapshot.ams && snapshot.ams->count > 0;
+  const uint8_t ams_count = snapshot.ams ? snapshot.ams->count : 0;
+  bool ams_changed = false;
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    const bool present = u < ams_count;
+    if (ams_unit_present_[u] != present) {
+      ams_unit_present_[u] = present;
+      ams_changed = true;
+    }
+  }
   const bool availability_changed =
       preview_page_available_ != preview_available || camera_page_available_ != camera_available ||
-      ams_page_available_ != ams_available;
+      ams_changed;
 
   preview_page_available_ = preview_available;
   camera_page_available_ = camera_available;
-  ams_page_available_ = ams_available;
 
   if (!availability_changed) {
     return;
   }
 
-  set_hidden(ams_page_, !ams_page_available_);
+  for (int u = 0; u < kMaxAmsUnits; ++u) {
+    if (ams_pages_[u] != nullptr) {
+      set_hidden(ams_pages_[u], !ams_unit_present_[u]);
+    }
+  }
   set_hidden(page2_, !preview_page_available_);
   set_hidden(page3_, !camera_page_available_);
 
@@ -2888,42 +3106,46 @@ void Ui::update_page_availability_locked(const PrinterSnapshot& snapshot) {
 }
 
 bool Ui::page_enabled(int page) const {
-  switch (page) {
-    case 0:
-      return true;
-    case 1:
-      return ams_page_available_;
-    case 2:
-      return true;
-    case 3:
-      return preview_page_available_;
-    case 4:
-      return camera_page_available_;
-    default:
-      return false;
+  if (page == kPageIdxPrinterSelect) {
+    return true;
   }
+  if (page >= kPageIdxAmsFirst && page <= kPageIdxAmsLast) {
+    return ams_unit_present_[page - kPageIdxAmsFirst];
+  }
+  if (page == kPageIdxMain) {
+    return true;
+  }
+  if (page == kPageIdxPreview) {
+    return preview_page_available_;
+  }
+  if (page == kPageIdxCamera) {
+    return camera_page_available_;
+  }
+  return false;
 }
 
 lv_obj_t* Ui::page_object(int page) const {
-  switch (page) {
-    case 0:
-      return page0_;
-    case 1:
-      return ams_page_;
-    case 2:
-      return page1_;
-    case 3:
-      return page2_;
-    case 4:
-      return page3_;
-    default:
-      return nullptr;
+  if (page == kPageIdxPrinterSelect) {
+    return page0_;
   }
+  if (page >= kPageIdxAmsFirst && page <= kPageIdxAmsLast) {
+    return ams_pages_[page - kPageIdxAmsFirst];
+  }
+  if (page == kPageIdxMain) {
+    return page1_;
+  }
+  if (page == kPageIdxPreview) {
+    return page2_;
+  }
+  if (page == kPageIdxCamera) {
+    return page3_;
+  }
+  return nullptr;
 }
 
 int Ui::next_enabled_page(int page, int direction) const {
   int candidate = page + direction;
-  while (candidate >= 0 && candidate <= 4) {
+  while (candidate >= 0 && candidate <= kPageIdxLast) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -2937,7 +3159,7 @@ int Ui::clamp_enabled_page(int page) const {
     return page;
   }
 
-  for (int candidate = 0; candidate <= 4; ++candidate) {
+  for (int candidate = 0; candidate <= kPageIdxLast; ++candidate) {
     if (page_enabled(candidate)) {
       return candidate;
     }
@@ -2960,7 +3182,7 @@ int Ui::nearest_enabled_page_for_scroll() const {
   int best_page = clamp_enabled_page(active_page_);
   int best_distance = INT32_MAX;
 
-  for (int page = 0; page <= 4; ++page) {
+  for (int page = 0; page <= kPageIdxLast; ++page) {
     if (!page_enabled(page)) {
       continue;
     }
@@ -2995,7 +3217,7 @@ void Ui::set_active_page(int page) {
   if (clamped_page == 0 && previous_page != 0) {
     replay_card_animations_locked();
   }
-  if (active_page_ == 3) {
+  if (active_page_ == kPageIdxPreview) {
     preview_image_visible_ = ensure_preview_image_loaded_locked(false);
   }
   scrolling_ = false;
@@ -3181,7 +3403,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
     // Horizontal page swiping is handled by the LVGL pager (flex-row +
     // LV_SCROLL_SNAP_NONE → handle_pager_event snaps to nearest page on SCROLL_END).
     // Only handle taps here (camera refresh on page 3).
-    if (active_page_ == 4 && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
+    if (active_page_ == kPageIdxCamera && camera_page_available_ && abs_dx < 12 && abs_dy < 12) {
       std::lock_guard<std::mutex> lock(camera_refresh_mutex_);
       camera_refresh_requested_ = true;
     }
@@ -3189,7 +3411,7 @@ void Ui::handle_screen_event(lv_event_t* event) {
 }
 
 void Ui::update_portal_access_visuals_locked() {
-  const bool show_page1 = !scrolling_ && active_page_ == 2;
+  const bool show_page1 = !scrolling_ && active_page_ == kPageIdxMain;
   const bool portal_hint_has_priority = portal_pin_active_ || portal_session_active_;
   const bool show_hint = portal_hint_label_ != nullptr && show_page1 && !portal_hint_text_.empty() &&
                          (portal_hint_has_priority || !detail_visible_);
